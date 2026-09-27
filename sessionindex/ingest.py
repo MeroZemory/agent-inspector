@@ -104,7 +104,7 @@ def discover(roots, cfg):
 
 # --------------------------------------------------------------------------- main
 
-MAX_CONCURRENT_INGESTS = int(os.environ.get("SX_MAX_INGESTS", "2"))
+MAX_CONCURRENT_INGESTS = int(os.environ.get("SX_MAX_INGESTS", "1"))  # >1 risks unique-key races between writers
 DEFAULT_WORKERS = int(os.environ.get("SX_WORKERS", "2"))
 
 
