@@ -104,7 +104,48 @@ def discover(roots, cfg):
 
 # --------------------------------------------------------------------------- main
 
-def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: int | None = None,
+MAX_CONCURRENT_INGESTS = int(os.environ.get("SX_MAX_INGESTS", "2"))
+DEFAULT_WORKERS = int(os.environ.get("SX_WORKERS", "2"))
+
+
+class _IngestSlot:
+    """Machine-wide cap on concurrent ingests (memory pressure): hold one of N lock files; wait while all are taken.
+    OS file locks are released automatically if the process dies."""
+
+    def __enter__(self):
+        from .config import DATA_DIR
+        os.makedirs(DATA_DIR, exist_ok=True)
+        waited = False
+        while True:
+            for i in range(MAX_CONCURRENT_INGESTS):
+                fh = open(os.path.join(DATA_DIR, f".ingest-slot-{i}.lock"), "a+b")
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.fh = fh
+                    return self
+                except OSError:
+                    fh.close()
+            if not waited:
+                print(f"[sx] {MAX_CONCURRENT_INGESTS} ingests already running; waiting for a free slot...", file=sys.stderr)
+                waited = True
+            time.sleep(5)
+
+    def __exit__(self, *exc):
+        self.fh.close()
+
+
+def run_ingest(*args, **kwargs) -> dict:
+    with _IngestSlot():
+        return _run_ingest(*args, **kwargs)
+
+
+def _run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: int | None = None,
                max_jobs: int | None = None, quiet: bool = False, reparse: bool = False,
                reparse_sql: str | None = None, select: dict | None = None, catalog: bool = False) -> dict:
     """select (on-demand subset): {'sid': [...], 'file': [...], 'project': str, 'since': str, 'until': str}.
@@ -352,7 +393,7 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
     jobs.sort(key=lambda j: -(j["size"] - j["start"]))
     stats_run = collections.Counter()
     touched = set()
-    workers = workers or max(2, min(16, (os.cpu_count() or 4) - 2))
+    workers = workers or DEFAULT_WORKERS
     done_bytes = 0
     t0 = time.time()
     last_log = 0.0
@@ -774,7 +815,7 @@ def _run_catalog(con, cjobs, group_info, workers, quiet):
     lite = [dict(j, prev=None) for j in cjobs]
     prev = {j["sid"]: j["prev"] for j in cjobs}
     byid = {j["sid"]: j for j in cjobs}
-    workers = workers or max(2, min(16, (os.cpu_count() or 4) - 2))
+    workers = workers or DEFAULT_WORKERS
     with ProcessPoolExecutor(workers) as ex:
         for res in ex.map(run_catalog_job, lite, chunksize=32):
             _write_catalog(con, res, byid[res["sid"]], group_info[res["sid"]], prev[res["sid"]])
