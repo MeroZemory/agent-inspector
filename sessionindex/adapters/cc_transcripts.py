@@ -12,7 +12,7 @@ import os
 
 from ..classify import claude_user_text_kind, classify_split
 from ..util import norm_ts, jdump
-from .base import Candidate, ParseOut, read_lines
+from .base import Candidate, ParseOut, read_head_tail, read_lines
 
 PROVIDER = "opencode"
 
@@ -90,3 +90,36 @@ def parse(job) -> dict:
 
 def home_metadata(root):
     return None
+
+
+def catalog(job) -> dict:
+    """First/last timestamps and the first prompt from the first and last 64 KB only."""
+    head, tail, size = read_head_tail(job["path"])
+    meta = {"models": {}, "client": "cc_transcripts"}
+    first = None
+    for raw in head:
+        try:
+            r = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        ts = norm_ts(r.get("timestamp"))
+        if ts:
+            meta.setdefault("first_ts", ts)
+            meta["last_ts"] = ts
+        if r.get("type") == "user" and first is None:
+            c = r.get("content")
+            for k, chunk in classify_split(c if isinstance(c, str) else jdump(c), _kind):
+                if k in ("human", "sdk_prompt", "agent_prompt") and chunk.strip():
+                    first = [k, chunk.strip()[:300]]
+                    break
+    for raw in reversed(tail):
+        try:
+            ts = norm_ts(json.loads(raw).get("timestamp"))
+        except (ValueError, AttributeError):
+            continue
+        if ts:
+            meta["last_ts"] = ts
+            break
+    return {"meta": meta, "aliases": [], "links": [], "first_prompt": first, "size": size}

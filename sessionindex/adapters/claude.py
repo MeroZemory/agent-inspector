@@ -11,7 +11,7 @@ import re
 
 from ..classify import claude_user_text_kind, classify_split, slash_text, bash_text
 from ..util import iso_to_epoch, norm_ts, jdump, ms_to_iso
-from .base import Candidate, ParseOut, read_lines
+from .base import CAT_BYTES, Candidate, ParseOut, read_head_tail, read_lines
 
 PROVIDER = "claude"
 TOKENS_LEFT_RE = re.compile(r"<total_tokens>\s*(\d+)")
@@ -522,3 +522,107 @@ def home_metadata(root) -> dict:
         except (OSError, ValueError):
             pass
     return res
+
+
+# ---------------------------------------------------------------- light catalog (head + tail only)
+
+_TS_RE = re.compile(rb'"timestamp":"([^"]+)"')
+_TITLE_RE = re.compile(rb'"type":"(ai-title|custom-title|agent-name|summary)"')
+_MODEL_RE = re.compile(rb'"model":"([^"<][^"]*)"')
+_BRANCH_RE = re.compile(rb'"gitBranch":"([^"]*)"')
+_CWD_RE = re.compile(rb'"cwd":"((?:[^"\\]|\\.)*)"')
+_TITLE_FIELDS = {"ai-title": ("aiTitle", "claude_ai_title", 0), "custom-title": ("customTitle", "claude_custom_title", 1),
+                 "agent-name": ("agentName", "claude_agent_name", 0), "summary": ("summary", "claude_summary", 0)}
+
+
+def catalog(job) -> dict:
+    """Session metadata from the first and last 64 KB only: cwd/branch/version/entrypoint, first prompt,
+    title records, last model and timestamps. The transcript body is not parsed."""
+    ctx = job.get("ctx") or {}
+    is_sub = job["subkind"] in ("subagent", "workflow_agent")
+    head, tail, size = read_head_tail(job["path"])
+    meta = {"models": {}, "slug": ctx.get("slug"), "archived": ctx.get("archived")}
+    aliases, first = [], None
+
+    def title(r, ts):
+        f = _TITLE_FIELDS.get(r.get("type"))
+        if f and r.get(f[0]):
+            aliases.append([str(r[f[0]])[:500], f[1], f[2], ts])
+
+    last_ts = None
+    for raw in head:
+        try:
+            r = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        ts = norm_ts(r.get("timestamp"))
+        if ts:
+            meta.setdefault("first_ts", ts)
+            last_ts = ts
+        typ = r.get("type")
+        if typ in ("user", "assistant", "system", "attachment"):
+            for src, dst in (("cwd", "cwd"), ("gitBranch", "git_branch"), ("version", "cli_version"),
+                             ("entrypoint", "client")):
+                if r.get(src) and not meta.get(dst):
+                    meta[dst] = r.get(src)
+        title(r, ts or last_ts)
+        if typ == "assistant":
+            mdl = (r.get("message") or {}).get("model")
+            if mdl and mdl != "<synthetic>":
+                meta["models"] = {mdl: 1}
+        if typ == "user" and first is None:
+            c = (r.get("message") or {}).get("content")
+            t = c if isinstance(c, str) else "\n".join(b.get("text") or "" for b in c or []
+                                                       if isinstance(b, dict) and b.get("type") == "text")
+            if t.strip():
+                o = r.get("origin") if isinstance(r.get("origin"), dict) else {}
+                k = claude_user_text_kind(t, is_meta=bool(r.get("isMeta")), is_compact=bool(r.get("isCompactSummary")),
+                                          okind=o.get("kind"), psrc=r.get("promptSource"),
+                                          is_sub=is_sub or bool(r.get("isSidechain")),
+                                          sdk_client=(meta.get("client") or "") in SDK_ENTRYPOINTS)
+                if k in ("human", "human_command", "human_shell", "sdk_prompt", "agent_prompt"):
+                    t = slash_text(t) if k == "human_command" else (bash_text(t) if k == "human_shell" else t)
+                    first = [k, t[:300]]
+    for raw in tail:
+        m = _TS_RE.search(raw[:400])
+        if m:
+            last_ts = norm_ts(m.group(1).decode("utf-8", "replace")) or last_ts
+        if _TITLE_RE.search(raw[:200]):
+            try:
+                title(json.loads(raw), last_ts)
+            except ValueError:
+                pass
+        elif b'"type":"assistant"' in raw[:400]:
+            mm = _MODEL_RE.search(raw)
+            if mm:
+                meta["models"] = {mm.group(1).decode("utf-8", "replace"): 1}
+        mb = _BRANCH_RE.search(raw[:2000])
+        if mb and mb.group(1):
+            meta["git_branch"] = mb.group(1).decode("utf-8", "replace")
+    if not meta.get("first_ts") or not meta.get("cwd"):
+        # the head can be a single oversized record (e.g. file-history-snapshot): regex over raw bytes
+        with open(job["path"], "rb") as fh:
+            raw_head = fh.read(CAT_BYTES)
+        m = _TS_RE.search(raw_head)
+        if m and not meta.get("first_ts"):
+            meta["first_ts"] = norm_ts(m.group(1).decode("utf-8", "replace"))
+            last_ts = last_ts or meta["first_ts"]
+        mc = _CWD_RE.search(raw_head)
+        if mc and not meta.get("cwd"):
+            try:
+                meta["cwd"] = json.loads(b'"' + mc.group(1) + b'"')
+            except ValueError:
+                pass
+    meta["last_ts"] = last_ts
+    if is_sub:
+        mp = ctx.get("meta_path")
+        if mp and os.path.exists(mp):
+            try:
+                with open(mp, encoding="utf-8") as fh:
+                    am = json.load(fh)
+                meta["agent_meta"] = {k: am.get(k) for k in ("agentType", "description", "parentAgentId", "model")}
+            except (OSError, ValueError):
+                pass
+    return {"meta": meta, "aliases": aliases, "links": [], "first_prompt": first, "size": size}

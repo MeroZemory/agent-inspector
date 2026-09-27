@@ -18,11 +18,12 @@ SORTS = {
     "last": "s.last_activity_at", "started": "s.started_at", "human_chars": "s.human_chars",
     "human": "s.human_msgs", "length": "s.duration_s", "active": "s.active_s", "msgs": "s.msgs_n",
     "errors": "s.errors", "tool_errors": "s.tool_errors", "interrupts": "s.interrupts",
-    "compactions": "s.compactions", "ctx": "s.max_ctx_tokens",
+    "compactions": "s.compactions", "ctx": "s.max_ctx_tokens", "hist": "s.hist_prompts", "size": "s.size_bytes",
 }
 SESSION_FIELDS = ["sid", "provider", "kind", "origin_class", "started_at", "last_activity_at", "project", "title",
-                  "human_msgs", "human_chars", "assistant_msgs", "tool_calls", "tool_errors", "errors", "interrupts",
-                  "compactions", "active_s"]
+                  "body", "hist_prompts", "size_bytes", "human_msgs", "human_chars", "assistant_msgs", "tool_calls",
+                  "tool_errors", "errors", "interrupts", "compactions", "active_s"]
+BODY_HINT = "body not ingested (catalog row only): run `sx ingest --sid {sid}` first"
 
 
 # ------------------------------------------------------------------ output helpers
@@ -113,6 +114,7 @@ def add_filters(p):
     p.add_argument("--subagents", choices=["exclude", "include", "only"], default="exclude")
     p.add_argument("--include-test", action="store_true", help="include test roots (probes, agentryx test homes)")
     p.add_argument("--sid", help="restrict to one session id/prefix")
+    p.add_argument("--body", choices=["yes", "no", "stale"], help="body ingested (yes), catalog-only (no), stale")
 
 
 def filter_sql(a, con, alias="s"):
@@ -164,6 +166,8 @@ def filter_sql(a, con, alias="s"):
     if getattr(a, "sid", None):
         w.append(f"{alias}.sid=?")
         args.append(resolve(con, a.sid))
+    if getattr(a, "body", None):
+        w.append({"yes": f"{alias}.body=1", "no": f"COALESCE({alias}.body,0)=0", "stale": f"{alias}.body=2"}[a.body])
     return (" AND ".join(w) if w else "1=1"), args
 
 
@@ -218,7 +222,9 @@ def cmd_stats(a):
         o.emit({"sessions": tot[0], "human_msgs": tot[1], "messages": tot[2], "first": tot[3], "last": tot[4],
                 "db_mb": round(os.path.getsize(DB_PATH) / 1e6, 1),
                 "scope": f"subagents={a.subagents}, test_roots={'include' if a.include_test else 'exclude'}",
-                "all_sessions": con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]})
+                "all_sessions": con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
+                "bodies_ingested": con.execute("SELECT COUNT(*) FROM sessions WHERE body>0").fetchone()[0],
+                "bodies_stale": con.execute("SELECT COUNT(*) FROM sessions WHERE body=2").fetchone()[0]})
         for r in con.execute("SELECT stats, started_at, finished_at FROM ingest_runs WHERE finished_at IS NOT NULL "
                              "ORDER BY run_id DESC LIMIT 1"):
             o.emit({"last_ingest": r[2], "stats": json.loads(r[0] or "{}")})
@@ -247,8 +253,10 @@ def cmd_sessions(a):
                 d[k] = d[k][:16]
         if d.get("active_s") is not None:
             d["active_min"] = round(d.pop("active_s") / 60, 1)
+        if d.get("size_bytes") is not None:
+            d["mb"] = round(d.pop("size_bytes") / 1e6, 2)
         if not a.fields:  # compact default: absent counter = 0/null
-            d = {k: v for k, v in d.items() if v not in (None, 0, "") or k in ("sid", "human_msgs")}
+            d = {k: v for k, v in d.items() if v not in (None, 0, "") or k in ("sid", "body")}
         o.emit(d)
     o.flush()
 
@@ -265,8 +273,19 @@ def cmd_show(a):
                               "last_activity_at", "duration_s", "active_s", "human_msgs", "human_chars",
                               "assistant_msgs", "tool_calls", "tool_errors", "errors", "interrupts", "compactions",
                               "subagent_spawns", "denials", "max_ctx_tokens", "ctx_window", "title", "title_origin",
-                              "parent_sid", "agent_type", "agent_name", "n_files", "n_copies", "inherited_msgs")
-            if s.get(k) not in (None, "", 0) or k in ("human_msgs", "sid")}
+                              "parent_sid", "agent_type", "agent_name", "n_files", "n_copies", "inherited_msgs",
+                              "body", "hist_prompts", "size_bytes", "first_prompt")
+            if s.get(k) not in (None, "", 0) or k in ("sid", "body")}
+    if meta.get("first_prompt"):
+        meta["first_prompt"] = clip(meta["first_prompt"].replace("\n", " "), 160)
+    if not s.get("body"):
+        meta["next"] = f"sx ingest --sid {sid}   # catalog row only; then sx show/read"
+    elif s.get("body") == 2:
+        meta["next"] = f"sx ingest --sid {sid}   # body is stale (file changed since ingest)"
+    orca = [{"kind": r[0], "name": clip(r[1], 60), "detail": clip(r[2], 80), "via": r[3]} for r in con.execute(
+        "SELECT kind, name, detail, method FROM orca WHERE sid=? ORDER BY method DESC, kind LIMIT 8", (sid,))]
+    if orca:
+        meta["orca"] = orca
     for k in ("duration_s", "active_s"):
         if meta.get(k) is not None:
             meta[k] = round(meta[k])
@@ -331,9 +350,18 @@ def parse_range(s):
     return int(s), int(s)
 
 
+def need_body(con, sid):
+    b = con.execute("SELECT body FROM sessions WHERE sid=?", (sid,)).fetchone()
+    if not b or not b[0]:
+        die(BODY_HINT.format(sid=sid), 3)
+    if b[0] == 2:
+        sys.stderr.write(f"[sx] body of {sid} is stale; refresh: sx ingest --sid {sid}\n")
+
+
 def cmd_read(a):
     con = ro()
     sid = resolve(con, a.id)
+    need_body(con, sid)
     o = Out(a.format)
     w, args = ["sid=?"], [sid]
     lo, hi = parse_range(a.seq)
@@ -395,6 +423,7 @@ def cmd_read(a):
 def cmd_raw(a):
     con = ro()
     sid = resolve(con, a.id)
+    need_body(con, sid)
     if a.event is not None:
         r = con.execute("SELECT e.file_id, e.offset, f.path FROM events e JOIN files f ON f.file_id=e.file_id "
                         "WHERE e.sid=? AND e.eid=?", (sid, a.event)).fetchone()
@@ -425,6 +454,10 @@ def cmd_search(a):
     con = ro()
     o = Out(a.format)
     w, args = filter_sql(a, con)
+    nb = con.execute(f"SELECT COUNT(*), SUM(COALESCE(s.body,0)=0) FROM sessions s WHERE {w}", args).fetchone()
+    if nb[1]:
+        sys.stderr.write(f"[sx] searching bodies only: {nb[1]} of {nb[0]} matching sessions are catalog-only; "
+                         f"ingest them first (sx ingest --sid a,b | --project P --since D)\n")
     kinds = None
     if a.human:
         kinds = list(HUMAN_KINDS)
@@ -538,7 +571,17 @@ def cmd_notes(a):
     o.flush(80)
 
 
+def cmd_catalog(a):
+    from .ingest import run_ingest
+    stats = run_ingest(source=a.source.split(",") if a.source else None, reparse=a.full, workers=a.workers,
+                       catalog=True)
+    sys.stdout.write(json.dumps(stats, ensure_ascii=False) + "\n")
+
+
 def cmd_ingest(a):
+    if not (a.all or a.sid or a.file or a.project or a.since or a.until or a.source or a.reparse_sql):
+        die("ingest parses transcript bodies: select what you need (--sid/--file/--project/--since/--until/"
+            "--source) or pass --all for everything. The session list itself comes from `sx catalog`.")
     from .ingest import run_ingest
     stats = run_ingest(source=a.source.split(",") if a.source else None, rebuild=a.rebuild, workers=a.workers,
                        max_jobs=a.max_jobs, reparse=a.reparse, reparse_sql=a.reparse_sql,
@@ -657,9 +700,16 @@ def build_parser():
     s.add_argument("--limit", type=int, default=50)
     s.set_defaults(fn=cmd_notes)
 
-    s = sub.add_parser("ingest", help="incremental ingest (all sources by default)")
+    s = sub.add_parser("catalog", help="light scan: list EVERY session (heads/tails + provider/Orca metadata, no bodies)")
+    s.add_argument("--source", help="comma list: adapter/root id/label (default: all roots)")
+    s.add_argument("--full", action="store_true", help="re-read every file's head/tail even if unchanged")
+    s.add_argument("--workers", type=int)
+    s.set_defaults(fn=cmd_catalog)
+
+    s = sub.add_parser("ingest", help="parse transcript bodies of selected sessions (see --sid/--project/...)")
     s.add_argument("--source", help="comma list: claude,codex,cc_transcripts or root ids/labels")
     s.add_argument("--rebuild", action="store_true", help="drop index.sqlite and re-parse (annotations kept)")
+    s.add_argument("--all", action="store_true", help="ingest every session body (slow: ~2 h for this PC)")
     s.add_argument("--reparse", action="store_true",
                    help="re-parse every selected session in place (after classifier/adapter changes)")
     s.add_argument("--reparse-sql", help="re-parse only the sessions whose sid this SELECT returns")

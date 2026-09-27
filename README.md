@@ -34,6 +34,30 @@ tools/validate_human.py      classification check against typed-prompt logs
 data/                        (gitignored) index.sqlite (rebuildable) + annotations.sqlite (never touched by ingest)
 ```
 
+## Catalog (the full list) -> ingest (selected bodies) -> read
+
+```
+python sx.py catalog                   # every session on the PC, light: ~4-5 min first run, incremental after
+python sx.py sessions --body no --sort hist --limit 20   # pick sessions from the catalog
+python sx.py ingest --sid <sid>,<sid>  # parse only those bodies, then: sx show / read / raw / search
+```
+
+`sx catalog` never parses transcript bodies. Per logical session (same inode/canonical-copy dedupe as ingest,
+except that size stands in for the line count among copies tied on last timestamp) it reads the file stat, the
+first 64 KB (Codex: the session_meta line) and the last 64 KB, plus provider stores (Codex session_index.jsonl,
+state_5 threads/thread_spawn_edges, thread_history_1, goals_1; history.jsonl per-session typed-prompt counts;
+Claude subagent .meta.json) and Orca metadata. Rows get `body=0`; `sx ingest` sets `body=1`; a catalog run
+that sees a changed file marks `body=2` (stale). `read`/`raw` refuse catalog-only rows with the exact ingest
+command; `search` warns how many matching sessions are catalog-only. `sx ingest` requires a selector
+(`--sid/--file/--project/--since/--until/--source`) or `--all`.
+Measured 2026-09-27: first full catalog 260 s wall, 18,555 sessions, DB 187 MB; incremental re-run 44 s.
+
+**Orca** (`sessionindex/orca.py`, metadata only, read-only; never opens orca-runtime.json, claude-accounts/**,
+recovery-*/**, ai-vault/**): tab/pane/worktree names, usage-cache session->worktree mappings, pane hook status,
+PTY meta (cwd/start/end/exit) and orchestration dispatches go to table `orca` (+ aliases `orca_tab_title`,
+`orca_ai_vault_title`, `orca_worktree_name`), joined by provider session id (`method=sessionId`) or by same cwd
++ start time within the PTY lifetime (`method=cwd_time`, may link several sessions).
+
 ## Ingest
 
 Index on demand (only what you need); selectors combine, and only matching sessions are probed/parsed:

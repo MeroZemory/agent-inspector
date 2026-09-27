@@ -106,7 +106,7 @@ def discover(roots, cfg):
 
 def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: int | None = None,
                max_jobs: int | None = None, quiet: bool = False, reparse: bool = False,
-               reparse_sql: str | None = None, select: dict | None = None) -> dict:
+               reparse_sql: str | None = None, select: dict | None = None, catalog: bool = False) -> dict:
     """select (on-demand subset): {'sid': [...], 'file': [...], 'project': str, 'since': str, 'until': str}.
     Only matching logical sessions are probed/parsed; everything else in the index is left untouched."""
     t_start = time.time()
@@ -131,7 +131,7 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
 
     run_id = con.execute("INSERT INTO ingest_runs(started_at,args) VALUES(?,?)",
                          (now_iso(), jdump({"source": source, "rebuild": rebuild, "reparse": reparse, "reparse_sql": reparse_sql,
-                                "max_jobs": max_jobs, "select": select}))).lastrowid
+                                "max_jobs": max_jobs, "select": select, "catalog": catalog}))).lastrowid
     con.commit()
 
     roots = all_roots = expand_roots(cfg)
@@ -215,7 +215,8 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
         groups = _select_groups(groups, select)
         log(f"selection {jdump(select)} -> {len(groups)} logical sessions")
 
-    sess_prev = {row[0]: row for row in con.execute("SELECT sid, canonical_file_id FROM sessions")}
+    sess_prev = {row[0]: row for row in con.execute(
+        "SELECT sid, canonical_file_id, body, cat_sig, started_at FROM sessions")}
     reparse_set = set()
     if reparse_sql:  # e.g. sessions affected by a classifier change
         reparse_set = {r[0] for r in con.execute(reparse_sql)}
@@ -259,6 +260,10 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
         if len(tied) > 1:
             for e in tied:
                 r = e["row"]
+                if catalog:  # catalog reads only heads/tails: size stands in for the line count
+                    e["lines"] = r[13] if (all(x["row"][13] is not None and x["row"][2] == x["size"]
+                                               for x in tied)) else e["size"]
+                    continue
                 if id(e) not in probed and r[2] == e["size"] and r[3] == e["mtime"] and r[13] is not None:
                     e["lines"] = r[13]
                 else:
@@ -275,6 +280,7 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
 
     # ---- plan
     jobs = []
+    cjobs = []
     group_info = {}
     role_updates = []
     for key, ents in groups.items():
@@ -303,8 +309,15 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
                            "is_test": all(e["root"].is_test for e in ents)}
         r = canon["row"]
         file_id = r[1]
+        if catalog:
+            sig = f"{file_id}:{canon['size']}:{canon['mtime']}"
+            if rebuild or reparse or prev is None or prev[3] != sig or (not prev[2] and not prev[4]):
+                cjobs.append({"sid": sid, "file_id": file_id, "path": canon["c"].path, "adapter": canon["root"].adapter,
+                              "subkind": canon["c"].subkind, "ctx": canon["c"].ctx, "size": canon["size"],
+                              "mtime_ns": canon["mtime"], "sig": sig, "prev": prev})
+            continue
         mode = None
-        if rebuild or reparse or sid in reparse_set or prev is None or prev[1] != file_id:
+        if rebuild or reparse or sid in reparse_set or prev is None or not prev[2] or prev[1] != file_id:
             mode = "full"
         elif r[7] == canon["size"] and r[8] == canon["mtime"]:
             mode = None
@@ -330,6 +343,9 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
     log(f"plan: {len(jobs)} jobs ({sum(1 for j in jobs if j['mode'] == 'full')} full, "
         f"{sum(1 for j in jobs if j['mode'] == 'append')} append), {total_bytes / 1e9:.2f} GB to read; "
         f"{len(groups) - len(jobs)} sessions unchanged")
+
+    if catalog:
+        _run_catalog(con, cjobs, group_info, workers, quiet)
 
     # ---- execute
     fts_mark = int(con.execute("SELECT COALESCE((SELECT value FROM meta WHERE key='fts_max_mid'),0)").fetchone()[0])
@@ -439,7 +455,16 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
 
     # ---- finalize (also sessions left unfinalized by an interrupted earlier run: msgs_n IS NULL)
     t0 = time.time()
-    pending = {r[0] for r in con.execute("SELECT sid FROM sessions WHERE msgs_n IS NULL")}
+    if catalog and not select:
+        t0 = time.time()
+        try:
+            from . import orca
+            ost = orca.collect_and_write(con)
+            stats_run.update({f"orca_{k}": v for k, v in ost.items()})
+            log(f"orca metadata in {time.time() - t0:.1f}s: {jdump(ost)}")
+        except Exception:
+            log(f"orca metadata failed: {traceback.format_exc()[-400:]}")
+    pending = {r[0] for r in con.execute("SELECT sid FROM sessions WHERE msgs_n IS NULL AND body>0")}
     if pending - touched:
         log(f"finalize: {len(pending - touched)} sessions left unfinalized by an earlier run")
     touched |= pending
@@ -645,7 +670,21 @@ def _upsert_session(con, sid, res, job, gi):
     ctx = job["ctx"] or {}
     merged["ctx"] = {k: v for k, v in ctx.items() if k != "meta_path"}
 
-    subkind = job["subkind"]
+    vals, agent_name, parent_pid = _session_vals(prov, pkey, merged, ctx, job["subkind"], gi, job["file_id"])
+    vals.update({"out_tokens": outtok or None, "rec_counts": jdump(rec), "parse_bad": bad,
+                 "msgs_n": None,  # NULL = aggregates pending; set by _finalize
+                 "body": 1, "size_bytes": job["size"], "cat_sig": f"{job['file_id']}:{job['size']}:{job['mtime_ns']}"})
+    cols = list(vals)
+    con.execute(f"INSERT INTO sessions(sid,{','.join(cols)}) VALUES(?,{','.join('?' * len(cols))}) "
+                f"ON CONFLICT(sid) DO UPDATE SET {','.join(f'{c}=excluded.{c}' for c in cols)}",
+                [sid] + [vals[c] for c in cols])
+    _session_links(con, sid, prov, pkey, merged, agent_name, parent_pid, "transcript")
+
+
+def _session_vals(prov, pkey, merged, ctx, subkind, gi, file_id):
+    """Session columns derivable from adapter metadata (shared by full ingest and the light catalog)."""
+    canon = gi["canon"]
+    root = canon["root"]
     agent_type = agent_name = parent_pid = None
     if prov == "claude":
         is_sub = subkind in ("subagent", "workflow_agent")
@@ -690,31 +729,103 @@ def _upsert_session(con, sid, res, job, gi):
         "parent_sid": short_sid(prov, parent_pid) if parent_pid else None, "parent_pid": parent_pid,
         "agent_type": agent_type, "agent_name": agent_name, "client": client, "source": source,
         "origin_class": origin_class, "root_id": root.root_id, "account": root.label,
-        "canonical_file_id": job["file_id"], "n_files": gi["n_files"], "n_copies": gi["n_units"] - 1,
+        "canonical_file_id": file_id, "n_files": gi["n_files"], "n_copies": gi["n_units"] - 1,
         "cwd": cwd, "cwd_key": (norm_path(cwd) or "").lower() or None,
         "project": proj, "project_root": proj_root, "project_method": method,
         "git_branch": merged.get("git_branch"), "git_origin": merged.get("git_origin"), "git_sha": merged.get("git_sha"),
         "cli_version": merged.get("cli_version"), "models": jdump(models), "model": model,
-        "ctx_window": merged.get("ctx_window"), "out_tokens": outtok or None,
-        "is_test": int(gi["is_test"]), "archived": archived, "rec_counts": jdump(rec), "parse_bad": bad,
+        "ctx_window": merged.get("ctx_window"),
+        "is_test": int(gi["is_test"]), "archived": archived,
         "meta": jdump(merged), "updated_at": now_iso(),
-        "msgs_n": None,  # NULL = aggregates pending; set by _finalize
     }
-    cols = list(vals)
-    con.execute(f"INSERT INTO sessions(sid,{','.join(cols)}) VALUES(?,{','.join('?' * len(cols))}) "
-                f"ON CONFLICT(sid) DO UPDATE SET {','.join(f'{c}=excluded.{c}' for c in cols)}",
-                [sid] + [vals[c] for c in cols])
+    return vals, agent_name, parent_pid
+
+
+def _session_links(con, sid, prov, pkey, merged, agent_name, parent_pid, source):
     if prov == "claude" and agent_name:
-        con.execute("INSERT OR IGNORE INTO aliases(sid,alias,origin,manual,ts,source) VALUES(?,?,?,?,?,'transcript')",
-                    (sid, agent_name[:500], "claude_subagent_description", 0, merged.get("first_ts")))
+        con.execute("INSERT OR IGNORE INTO aliases(sid,alias,origin,manual,ts,source) VALUES(?,?,?,?,?,?)",
+                    (sid, agent_name[:500], "claude_subagent_description", 0, merged.get("first_ts"), source))
     if parent_pid:
         con.execute("INSERT OR IGNORE INTO links(src_sid,rel,dst_sid,dst_provider,dst_pid,provenance,source) "
-                    "VALUES(?,?,?,?,?,?,'transcript')",
+                    "VALUES(?,?,?,?,?,?,?)",
                     (sid, "subagent_of", short_sid(prov, parent_pid), prov, parent_pid,
-                     "subagent file location/meta" if prov == "claude" else "session_meta.parent_thread_id"))
+                     "subagent file location/meta" if prov == "claude" else "session_meta.parent_thread_id", source))
     if prov == "codex" and merged.get("pid") and merged.get("pid") != pkey:
-        con.execute("INSERT OR IGNORE INTO facts(sid,key,value,origin,ts,source) VALUES(?,?,?,?,?,'transcript')",
-                    (sid, "session_meta_id_mismatch", merged.get("pid"), "codex_session_meta", None))
+        con.execute("INSERT OR IGNORE INTO facts(sid,key,value,origin,ts,source) VALUES(?,?,?,?,?,?)",
+                    (sid, "session_meta_id_mismatch", merged.get("pid"), "codex_session_meta", None, source))
+
+
+
+def run_catalog_job(job: dict) -> dict:
+    """Worker entry point for the light catalog (head/tail reads only)."""
+    try:
+        res = ADAPTERS[job["adapter"]].catalog(job)
+    except Exception:
+        res = {"error": traceback.format_exc()[-1500:]}
+    res["sid"] = job["sid"]
+    return res
+
+
+def _run_catalog(con, cjobs, group_info, workers, quiet):
+    """Catalog rows for every planned session: heads/tails only, never the transcript body."""
+    t0 = time.time()
+    last_log = t0
+    n = 0
+    lite = [dict(j, prev=None) for j in cjobs]
+    prev = {j["sid"]: j["prev"] for j in cjobs}
+    byid = {j["sid"]: j for j in cjobs}
+    workers = workers or max(2, min(16, (os.cpu_count() or 4) - 2))
+    with ProcessPoolExecutor(workers) as ex:
+        for res in ex.map(run_catalog_job, lite, chunksize=32):
+            _write_catalog(con, res, byid[res["sid"]], group_info[res["sid"]], prev[res["sid"]])
+            n += 1
+            if time.time() - last_log > 15 and not quiet:
+                con.commit()
+                log(f"catalog {n}/{len(cjobs)} sessions")
+                last_log = time.time()
+    con.commit()
+    log(f"catalog: {n} sessions read (heads/tails) in {time.time() - t0:.1f}s")
+
+
+def _write_catalog(con, res, job, gi, prev):
+    sid = job["sid"]
+    if "error" in res:
+        con.execute("UPDATE files SET error=? WHERE file_id=?", (res["error"][-1000:], job["file_id"]))
+        return
+    prov, pkey = gi["key"]
+    m = res["meta"]
+    if prev and prev[2]:  # body already ingested: keep parsed data, flag a stale body
+        row = con.execute("SELECT parsed_size, parsed_mtime_ns FROM files WHERE file_id=?", (job["file_id"],)).fetchone()
+        fresh = prev[1] == job["file_id"] and row and row[0] == job["size"] and row[1] == job["mtime_ns"]
+        con.execute("UPDATE sessions SET last_activity_at=MAX(COALESCE(last_activity_at,''),COALESCE(?,'')), "
+                    "n_files=?, n_copies=?, size_bytes=?, cat_sig=?, body=? WHERE sid=?",
+                    (m.get("last_ts"), gi["n_files"], gi["n_units"] - 1, job["size"], job["sig"], 1 if fresh else 2, sid))
+        return
+    ctx = job["ctx"] or {}
+    merged = dict(m)
+    merged["ctx"] = {k: v for k, v in ctx.items() if k != "meta_path"}
+    vals, agent_name, parent_pid = _session_vals(prov, pkey, merged, ctx, job["subkind"], gi, job["file_id"])
+    st, en = m.get("first_ts"), m.get("last_ts")
+    fp = res.get("first_prompt")
+    vals.update({"body": 0, "cat_sig": job["sig"], "size_bytes": job["size"], "started_at": st,
+                 "last_activity_at": en, "first_prompt": fp[1] if fp else None,
+                 "duration_s": (iso_to_epoch(en) - iso_to_epoch(st)) if (st and en and iso_to_epoch(st) and
+                                                                         iso_to_epoch(en)) else None})
+    cols = list(vals)
+    _exec_rows(con, f"INSERT INTO sessions(sid,{','.join(cols)}) VALUES(?,{','.join('?' * len(cols))}) "
+                    f"ON CONFLICT(sid) DO UPDATE SET {','.join(f'{c}=excluded.{c}' for c in cols)}",
+               [[sid] + [vals[c] for c in cols]])
+    con.execute("DELETE FROM aliases WHERE sid=? AND source='catalog'", (sid,))
+    con.execute("DELETE FROM links WHERE src_sid=? AND source='catalog'", (sid,))
+    al = list(res.get("aliases") or [])
+    if fp and fp[0] in HUMAN_KINDS:
+        al.append([fp[1][:200], "first_human_prompt", 0, st])
+    _exec_rows(con, "INSERT OR IGNORE INTO aliases(sid,alias,origin,manual,ts,source) VALUES(?,?,?,?,?,'catalog')",
+               [(sid, a[0], a[1], a[2], a[3]) for a in al if a[0] and str(a[0]).strip()])
+    _exec_rows(con, "INSERT OR IGNORE INTO links(src_sid,rel,dst_sid,dst_provider,dst_pid,provenance,source) "
+                    "VALUES(?,?,?,?,?,?,'catalog')",
+               [(sid, lk[0], short_sid(lk[1], lk[2]), lk[1], lk[2], lk[3]) for lk in res.get("links") or []])
+    _session_links(con, sid, prov, pkey, merged, agent_name, parent_pid, "catalog")
 
 
 def _home_sig(ad, root) -> str | None:
@@ -761,7 +872,7 @@ TITLE_PRIORITY = [
     ("claude_custom_title", 0), ("codex_state_name", 0), ("codex_thread_name_event", 1),
     ("claude_ai_title", 2), ("codex_session_index", 2), ("codex_state_title", 3), ("claude_summary", 3),
     ("claude_agent_name", 4), ("claude_subagent_description", 4), ("codex_agent_nickname", 5),
-    ("first_human_prompt", 9),
+    ("orca_tab_title", 5), ("orca_ai_vault_title", 5), ("orca_worktree_name", 7), ("first_human_prompt", 9),
 ]
 _TP = dict(TITLE_PRIORITY)
 
@@ -870,6 +981,10 @@ def _finalize(con, touched, group_info, root_by_id):
                 "(SELECT sid FROM messages WHERE imported=1 GROUP BY sid) AND NOT EXISTS "
                 "(SELECT 1 FROM messages m WHERE m.sid=sessions.sid AND m.imported=0 AND m.kind IN "
                 "('human','human_command','human_shell','assistant'))")
+    # typed-prompt log counts (a cheap activity measure for catalog rows) and model fallback from Codex state DB
+    con.execute("UPDATE sessions SET hist_prompts=(SELECT COUNT(*) FROM prompt_history p WHERE p.sid=sessions.sid)")
+    con.execute("UPDATE sessions SET model=(SELECT value FROM facts f WHERE f.sid=sessions.sid AND f.key='state.model' "
+                "LIMIT 1) WHERE model IS NULL")
     # archived via codex state facts
     con.execute("UPDATE sessions SET archived=1 WHERE sid IN (SELECT sid FROM facts WHERE key='state.archived' "
                 "AND value IN ('1','true'))")

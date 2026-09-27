@@ -10,6 +10,7 @@ An adapter provides:
 from __future__ import annotations
 
 import collections
+import os
 from dataclasses import dataclass, field
 
 from ..classify import PROMPT_KINDS
@@ -112,3 +113,26 @@ def read_lines(path: str, start: int):
         for raw in fh:
             yield off, raw, raw.endswith(b"\n")
             off += len(raw)
+
+
+# ---------------------------------------------------------------- light catalog helper (no body parse)
+
+CAT_BYTES = 65536
+
+
+def read_head_tail(path, n=CAT_BYTES):
+    """(head_lines, tail_lines, size): complete lines of the first and last n bytes (read-only)."""
+    with open(path, "rb") as fh:
+        head = fh.read(n)
+        size = os.fstat(fh.fileno()).st_size
+        tail = b""
+        if size > n:
+            start = max(n, size - n)
+            fh.seek(start)
+            tail = fh.read()
+            if start > 0:
+                tail = tail[tail.find(b"\n") + 1:]
+    hl = head.split(b"\n")
+    if size > n:
+        hl = hl[:-1]  # last head line is partial
+    return [x for x in hl if x.strip()], [x for x in tail.split(b"\n") if x.strip()], size

@@ -57,6 +57,9 @@ ALIAS_ORIGINS = {
     "claude_agent_name": "Claude agent-name record (fallback)",
     "claude_subagent_description": "Subagent task description from .meta.json",
     "codex_agent_nickname": "Codex subagent nickname",
+    "orca_tab_title": "Orca tab title (customTitle/label/generated; manual vs automatic not recorded)",
+    "orca_ai_vault_title": "Orca aiVaultTitle for the tab's session (auto)",
+    "orca_worktree_name": "Orca worktree/folder display name",
     "first_human_prompt": "auto (first prompt text, 200 chars)",
 }
 
@@ -77,7 +80,10 @@ SCHEMA_DOCS = {
         ("assistant_msgs/assistant_chars/tool_calls", "counts excluding imported/inherited"),
         ("tool_errors/errors/interrupts/compactions/subagent_spawns/denials", "counts of transcript events (see events)"),
         ("max_ctx_tokens/ctx_window", "max context tokens seen (Claude input+cache tokens; Codex last_token_usage.total_tokens)"),
-        ("title/title_origin", "best alias: manual > auto title > first prompt"),
+        ("title/title_origin", "best alias: manual > auto title > Orca tab/worktree name > first prompt"),
+        ("body", "0 = catalog row only (run sx ingest --sid), 1 = body ingested, 2 = body stale (file changed)"),
+        ("hist_prompts/size_bytes", "typed prompts logged in history.jsonl for this session / canonical file size (catalog)"),
+        ("first_prompt", "first prompt text (300 chars; catalog reads it from the file head)"),
         ("n_files/n_copies", "physical files for this session / distinct non-canonical content copies"),
         ("inherited_msgs", "messages copied from a fork/import parent or marked imported"),
         ("rec_counts", "JSON counts of raw record types (discover unmapped signals here)"),
@@ -102,11 +108,17 @@ SCHEMA_DOCS = {
     "files": [("path,root_id,pkey,sid,role,relation,size,mtime_ns,dev,ino,last_ts,probe_lines,parsed_offset,n_lines,n_bad,partial_tail",
                "every physical file; role canonical|hardlink|copy|missing; relation for copies same_extent|older_extent|newer_extent")],
     "prompt_history": [("sid,provider,pid,ts,text,project", "typed-prompt logs (~/.claude/history.jsonl, CODEX_HOME/history.jsonl): ground truth for human typing")],
+    "orca": [("sid,kind,key,name,detail,ts,method",
+              "Orca links: kind tab|pane|worktree|pty|orch_dispatch_contexts|orch_worker_dispatches|orch_worker_terminal_resources; "
+              "method sessionId (direct) or cwd_time (same cwd + time overlap; may be ambiguous)")],
     "ann.annotations": [("id,sid,seq,tag,note,author,created_at", "agent-written notes (separate DB, never touched by ingest)")],
     "messages_fts": [("text", "FTS5 trigram index over view fts_src: full text for prompts/assistant/reasoning; tool_call first 512 chars; tool_output: stored text if is_error=1, else first 256 + last 512 chars; developer/context_injection/system_reminder/meta/command_expansion/hook_output not indexed (use --like or sql LIKE)")],
 }
 
 EXAMPLES = """\
+sx catalog                                       # refresh the full session list (light; incremental)
+sx sessions --body no --sort hist --limit 10     # busiest catalog-only sessions by typed prompts
+sx ingest --sid xabc123,cdef456                  # parse only the bodies you picked
 sx stats --by month                              # corpus shape
 sx ingest --project Agentryx --since 2026-09-20   # index only what you need (also --sid/--file/--source/--until)
 sx sessions --provider codex --min-human 5 --sort human_chars --limit 10
@@ -153,8 +165,11 @@ def build(sections, live: dict) -> str:
                    f"messages={live.get('messages')} events={live.get('events')}")
         out.append("Output is JSON Lines by default (--format table for humans). IDs: sid prefix or provider id prefix.")
         out.append("Commands: guide stats sessions show read raw search sql note notes ingest  (sx <cmd> -h for flags)")
-        out.append("Start: `sx stats --by provider` -> `sx sessions [filters]` -> `sx show <sid>` (one line per human turn) "
-                   "-> `sx read <sid> --turn a-b` -> `sx raw <sid> --seq N` for the untruncated source record. "
+        out.append("Workflow: 1) `sx catalog` (if the catalog is missing/old; lists EVERY session from file heads/tails + "
+                   "provider/Orca metadata, no bodies)  2) `sx sessions [filters]` / `sx stats` / `sx show <sid>` on the "
+                   "catalog (body=0 rows have titles, cwd, times, sizes, typed-prompt counts)  3) `sx ingest --sid a,b` "
+                   "(or --project P --since D) for the sessions you selected  4) `sx show <sid>` (one line per human "
+                   "turn) -> `sx read <sid> --turn a-b` -> `sx raw <sid> --seq N` -> `sx search` (ingested bodies only). "
                    "Record findings with `sx note`.")
     if "schema" in sections:
         out.append("\n## schema (tables: columns - meaning)")

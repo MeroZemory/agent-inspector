@@ -286,14 +286,8 @@ def parse(job) -> dict:
             if tid is None and this_line == 0:
                 tid = pid
                 st["tid"] = tid
-                src = pl.get("source")
-                s_str = _src_str(src)
+                s_str, is_sub, nonint = _flags(pl)
                 thread_src = pl.get("thread_source")
-                is_sub = s_str.startswith("subagent") or thread_src == "subagent" or bool(pl.get("agent_role")) \
-                    or bool(pl.get("agent_nickname"))
-                orig = str(pl.get("originator") or "")
-                nonint = (not is_sub) and (s_str in ("exec", "mcp") or s_str.startswith(("custom", "internal"))
-                                           or orig in PROGRAMMATIC_ORIGINATORS or orig.startswith("probe"))
                 st["is_sub"] = is_sub
                 st["nonint"] = nonint
                 git = pl.get("git") or {}
@@ -674,3 +668,74 @@ def home_metadata(root) -> dict:
         except (OSError, ValueError) as e:
             res["errors"].append(f"imports: {e}")
     return res
+
+
+# ---------------------------------------------------------------- light catalog (head + tail only)
+
+def catalog(job) -> dict:
+    """Session metadata from the first line (session_meta) and the last 64 KB only."""
+    path = job["path"]
+    with open(path, "rb") as fh:
+        first = fh.readline(16 << 20)
+        size = os.fstat(fh.fileno()).st_size
+        start = max(len(first), size - 65536)
+        fh.seek(start)
+        tail = fh.read()
+    if start > len(first):
+        tail = tail[tail.find(b"\n") + 1:]
+    meta = {"models": {}}
+    aliases, links = [], []
+    try:
+        r = json.loads(first)
+    except ValueError:
+        r = {}
+    pl = r.get("payload") if isinstance(r, dict) and r.get("type") == "session_meta" else None
+    if isinstance(pl, dict):
+        s_str, is_sub, nonint = _flags(pl)
+        git = pl.get("git") or {}
+        ts = norm_ts(r.get("timestamp"))
+        meta.update({
+            "pid": pl.get("id"), "cwd": pl.get("cwd"), "client": pl.get("originator"),
+            "cli_version": pl.get("cli_version"), "source": s_str, "thread_source": pl.get("thread_source"),
+            "agent_name": pl.get("agent_nickname"), "agent_type": pl.get("agent_role"),
+            "forked_from": pl.get("forked_from_id"), "parent_thread": pl.get("parent_thread_id"),
+            "git_branch": git.get("branch"), "git_origin": git.get("repository_url"), "git_sha": git.get("commit_hash"),
+            "is_sub": is_sub, "nonint": nonint, "first_ts": ts,
+        })
+        if pl.get("forked_from_id"):
+            links.append(["forked_from", "codex", pl.get("forked_from_id"), "session_meta.forked_from_id"])
+        if pl.get("parent_thread_id"):
+            links.append(["subagent_of" if is_sub else "parent_thread", "codex", pl.get("parent_thread_id"),
+                          "session_meta.parent_thread_id"])
+        if pl.get("agent_nickname"):
+            aliases.append([str(pl.get("agent_nickname"))[:500], "codex_agent_nickname", 0, ts])
+    last_ts = meta.get("first_ts")
+    for line in tail.split(b"\n"):
+        m = HDR.match(line[:300])
+        if not m:
+            continue
+        last_ts = norm_ts(m.group(1).decode()) or last_ts
+        typ, sub = m.group(3), m.group(4)
+        if typ == b"turn_context" or (typ == b"event_msg" and sub == b"thread_name_updated"):
+            try:
+                p2 = json.loads(line).get("payload") or {}
+            except ValueError:
+                continue
+            if typ == b"turn_context" and p2.get("model"):
+                meta["models"] = {p2["model"]: 1}
+            elif p2.get("thread_name") or p2.get("name"):
+                aliases.append([str(p2.get("thread_name") or p2.get("name"))[:500], "codex_thread_name_event", None,
+                                last_ts])
+    meta["last_ts"] = last_ts
+    return {"meta": meta, "aliases": aliases, "links": links, "first_prompt": None, "size": size}
+
+
+def _flags(pl):
+    """(source string, is_subagent, non-interactive) from a session_meta payload."""
+    s_str = _src_str(pl.get("source"))
+    is_sub = s_str.startswith("subagent") or pl.get("thread_source") == "subagent" or bool(pl.get("agent_role")) \
+        or bool(pl.get("agent_nickname"))
+    orig = str(pl.get("originator") or "")
+    nonint = (not is_sub) and (s_str in ("exec", "mcp") or s_str.startswith(("custom", "internal"))
+                               or orig in PROGRAMMATIC_ORIGINATORS or orig.startswith("probe"))
+    return s_str, is_sub, nonint

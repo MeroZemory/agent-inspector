@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sqlite3
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 INDEX_DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS sessions(
   subagent_spawns INTEGER, denials INTEGER, events_n INTEGER, msgs_n INTEGER, inherited_msgs INTEGER,
   max_ctx_tokens INTEGER, ctx_window INTEGER, out_tokens INTEGER,
   title TEXT, title_origin TEXT, first_prompt TEXT,
-  is_test INTEGER, archived INTEGER, rec_counts TEXT, parse_bad INTEGER, meta TEXT, updated_at TEXT);
+  is_test INTEGER, archived INTEGER, rec_counts TEXT, parse_bad INTEGER, meta TEXT, updated_at TEXT,
+  body INTEGER DEFAULT 0, cat_sig TEXT, size_bytes INTEGER, hist_prompts INTEGER);
 CREATE INDEX IF NOT EXISTS sessions_last ON sessions(last_activity_at);
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS sessions_pid ON sessions(pid);
@@ -103,6 +104,10 @@ CREATE VIEW IF NOT EXISTS fts_src AS SELECT mid, CASE
   ELSE text END AS text FROM messages;
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   text, content='fts_src', content_rowid='mid', tokenize='trigram');
+
+CREATE TABLE IF NOT EXISTS orca(
+  sid TEXT, kind TEXT, key TEXT, name TEXT, detail TEXT, ts TEXT, method TEXT);
+CREATE INDEX IF NOT EXISTS orca_sid ON orca(sid);
 
 CREATE TABLE IF NOT EXISTS ingest_runs(
   run_id INTEGER PRIMARY KEY, started_at TEXT, finished_at TEXT, args TEXT, stats TEXT);
