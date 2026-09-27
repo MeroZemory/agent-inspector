@@ -10,11 +10,23 @@ import collections
 import json
 import os
 
-from ..classify import claude_user_text_kind
+from ..classify import claude_user_text_kind, classify_split
 from ..util import norm_ts, jdump
 from .base import Candidate, ParseOut, read_lines
 
 PROVIDER = "opencode"
+
+
+# delegation prompts written by an orchestrator agent (oh-my-opencode style task handoffs); heuristic
+DELEGATION_PREFIXES = ("[CONTEXT]", "## TASK", "# TASK", "1. TASK")
+
+
+def _kind(t: str) -> str:
+    k = claude_user_text_kind(t, is_meta=False, is_compact=False, okind=None, psrc=None, is_sub=False,
+                              sdk_client=False)
+    if k == "human" and t.lstrip().startswith(DELEGATION_PREFIXES):
+        return "agent_prompt"
+    return k
 
 
 def discover(root):
@@ -61,9 +73,8 @@ def parse(job) -> dict:
         if t == "user":
             c = r.get("content")
             txt = c if isinstance(c, str) else jdump(c)
-            k = claude_user_text_kind(txt, is_meta=False, is_compact=False, okind=None, psrc=None,
-                                      is_sub=False, sdk_client=False)
-            out.msg(ts, "user", k, txt, off=off, line=this_line, origin="cc_transcript")
+            for k, chunk in classify_split(txt, _kind):
+                out.msg(ts, "user", k, chunk, off=off, line=this_line, origin="cc_transcript")
         elif t == "tool_use":
             inp = r.get("tool_input")
             out.msg(ts, "assistant", "tool_call", inp if isinstance(inp, str) else jdump(inp), off=off,

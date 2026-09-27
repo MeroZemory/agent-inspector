@@ -51,6 +51,7 @@ def ms_to_iso(ms) -> str | None:
 
 
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+_ISO_Z_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z?$")
 
 
 def norm_ts(ts) -> str | None:
@@ -61,8 +62,9 @@ def norm_ts(ts) -> str | None:
         return ms_to_iso(ts)
     s = str(ts)
     if _ISO_RE.match(s):
-        if s.endswith("Z"):
-            return s
+        m = _ISO_Z_RE.match(s)
+        if m:  # UTC (Z or no zone): canonical millisecond form so strings sort and compare correctly
+            return f"{m.group(1)}.{(m.group(2) or '')[:3].ljust(3, '0')}Z"
         try:
             d = _dt.datetime.fromisoformat(s)
             if d.tzinfo is None:

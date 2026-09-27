@@ -28,6 +28,7 @@ sessionindex/
   ingest.py                  discovery, dedupe, canonical selection, incremental plan, worker pool, finalize, FTS
   projects.py                derived project from cwd (git root / git-worktree -> main repo / patterns)
   cli.py, guide.py           query CLI and the self-describing guide
+tools/selftest.py            adapter sanity + append-resume equivalence on a small subset (no index needed)
 tools/spotcheck.py           raw-vs-index spot checks (independent reader)
 tools/validate_human.py      classification check against typed-prompt logs
 data/                        (gitignored) index.sqlite (rebuildable) + annotations.sqlite (never touched by ingest)
@@ -35,38 +36,61 @@ data/                        (gitignored) index.sqlite (rebuildable) + annotatio
 
 ## Ingest
 
+Index on demand (only what you need); selectors combine, and only matching sessions are probed/parsed:
+
 ```
-python sx.py ingest                    # incremental; all roots in sources.json
-python sx.py ingest --source codex     # adapter/provider/root id/label filter (comma list)
+python sx.py ingest --sid x2ezyvekqm,01a06ef9-7ac1      # one or more sessions (short sid or provider id prefix)
+python sx.py ingest --file C:/Users/me/.codex/sessions/2026/09/05/rollout-...jsonl   # the session owning a file
+python sx.py ingest --project Agentryx --since 2026-09-20            # cwd/project substring + changed since (UTC)
+python sx.py ingest --source orca-acct-b4012820 --until 2026-09-01   # one root; sessions started before a date
+python sx.py ingest                    # everything (all roots in sources.json), incremental
+python sx.py ingest --reparse [--sid ...|--source ...]   # re-parse in place after classifier changes
+python sx.py ingest --reparse-sql "SELECT sid FROM sessions WHERE provider='claude'"
 python sx.py ingest --rebuild          # delete index.sqlite and re-parse (annotations kept)
-python sx.py ingest --max-jobs 300     # trial: parse an evenly sampled subset of sessions
 ```
+
+Re-running the same selection is a no-op for unchanged files. Each run also refreshes per-root home metadata
+(aliases/links/typed-prompt logs; ~25-50 s when a CODEX_HOME changed). Measured full build of this PC
+(2026-09-27, 18.5k sessions, 81 GB canonical): parse ~35 min, finalize ~7 min, FTS ~70 min, DB ~12 GB.
 
 * **Sources are opened read-only.** Transcripts are read with `open(..., 'rb')`; provider SQLite files with
   `mode=ro` URIs. Nothing under a source root is written, moved or deleted. Credential files are never
   opened (adapters only open `*.jsonl`, `*.meta.json`, the named metadata files, and `state_5`/`thread_history_1`/`goals_1` SQLite DBs).
 * **Physical vs logical.** Every discovered file is a row in `files` (path, root, size, mtime, dev/ino, role).
   Files are grouped by logical session key (Claude `sessionId` or `<sessionId>:agent-<id>` for subagents;
-  Codex thread id from the rollout file name). Hardlinks (same `(st_dev, st_ino)`) collapse to one content
-  unit. When a session has several distinct content units (Codex homes copied across Orca accounts,
-  archived vs active, migrated/rewritten copies), a cheap head/tail probe picks the **canonical** copy:
-  latest last-record timestamp, then larger size, then lower root rank (`~/.codex` = 0). Only the canonical
-  copy is parsed; the others stay in `files` with `role=hardlink|copy` and `relation=same_extent|older_extent`.
+  Codex thread id = the last UUID in the rollout file name). Measured 2026-09-27: the file-name id equals
+  `session_meta.payload.id` in 18,157 of 18,158 parseable unique Codex files and the Claude file name equals
+  `sessionId` in all main/subagent files. The one Codex exception is a repair artifact
+  (`rollout-...-<idA>_<idB>.jsonl`, content = thread B, header rewritten to A); it stays grouped with B and gets
+  fact `session_meta_id_mismatch`. Hardlinks (same `(st_dev, st_ino)`) collapse to one content unit and only
+  one representative per unit is ever opened. When a session has several distinct units (Codex homes copied
+  across Orca accounts, archived vs active, migrated/rewritten copies), the **canonical** copy is: latest
+  last-record timestamp (head/tail probe), then **more lines** (counted only for copies tied on that
+  timestamp; cached in `files.probe_lines` per size+mtime), then lower root rank (`~/.codex` = 0). Only the
+  canonical copy is parsed; the others stay in `files` with `role=hardlink|copy` and
+  `relation=same_extent|older_extent|newer_extent` (by last timestamp).
 * **Incremental.** Each canonical file stores `parsed_offset`, size, mtime, a SHA-1 of its first 4 KB and a
   small parser state. Unchanged -> skipped. Grown with the same head -> parsed from the stored byte offset
   (append-only JSONL). Rewritten/shrunk/canonical changed -> full re-parse of that session. A truncated last
   line is not consumed (`partial_tail=1`) and is picked up when the file grows. Malformed lines are counted
-  (`files.n_bad`, `sessions.parse_bad`) and skipped.
+  (`files.n_bad`, `sessions.parse_bad`) and skipped. `tools/selftest.py` checks that a file parsed in two
+  appends yields exactly the rows of one full parse.
+* **Resumable.** Parsed sessions are committed every few seconds; a session's aggregates are recomputed
+  whenever `sessions.msgs_n IS NULL` (left by an interrupted run), and FTS is built in committed `mid`
+  batches (`meta.fts_max_mid`). Re-running `sx ingest` after an interruption continues where it stopped.
 * **Parallel.** Parsing runs in a process pool (default `cpu-2`, max 16), largest files first; one writer
   process owns SQLite. Codex lines are pre-classified with a header regex so heavy duplicate records
   (`world_state`, `token_usage_record`, deltas, `item_started`...) are counted without JSON parsing.
 * **Stored text.** Human, prompt, assistant, reasoning-summary and compaction texts are stored in full.
-  Tool calls store name + arguments (capped at 16 KB). Tool outputs keep the first 2.5 KB + last 1.5 KB
+  Tool calls store name + arguments (capped at 256 KB). Tool outputs keep the first 2.5 KB + last 1.5 KB
   (cap 4 KB) and injected boilerplate is capped at 4 KB; `text_len` always holds the original length and
   `file_id + offset` locate the exact source line (`sx raw`). Encrypted reasoning blobs are never stored.
 * **Idempotent metadata.** Per-root metadata (aliases, links, facts, typed-prompt history, Codex state-DB turn
-  failures) is replaced wholesale per root on every run (`source='home:<root_id>'`); transcript-derived rows
-  use `source='transcript'` and are replaced when their session is re-parsed.
+  failures) is rebuilt per adapter as one unit over all of that adapter's roots (`source='home:<root_id>'`),
+  and skipped when no metadata file of those roots changed size/mtime. Transcript-derived rows use
+  `source='transcript'` and are replaced when their session is re-parsed; `source='derived'` events
+  (token_pressure) are recomputed at finalize. Alias `current=1` marks the latest-timestamped name per
+  (session, origin), e.g. the last `session_index.jsonl` line across all CODEX_HOMEs.
 
 ## Schema (summary; `sx guide --section schema` is authoritative)
 
@@ -80,7 +104,7 @@ python sx.py ingest --max-jobs 300     # trial: parse an evenly sampled subset o
 | `facts` | provider metadata key/values (Codex state threads, goals, PR links, cost) |
 | `files` | every physical file incl. copies/hardlinks, parse offsets, errors |
 | `prompt_history` | typed-prompt logs from `~/.claude/history.jsonl` and each `CODEX_HOME/history.jsonl` |
-| `messages_fts` | FTS5 trigram index over view `fts_src` |
+| `messages_fts` | FTS5 trigram index over view `fts_src` (prompts/assistant/reasoning full; tool_call first 512 chars; tool_output full if is_error else first 256 + last 512; injected kinds not indexed) |
 | `ann.annotations` | separate `annotations.sqlite`: agent-written tags/notes; ingest never touches it |
 
 `sid` = provider letter (`c` Claude, `x` Codex, `o` ses_* transcripts) + 9 base32 chars of
@@ -92,6 +116,8 @@ The user role carries much more than what a person typed. Rules are ordered (fir
 `sessionindex/classify.py`.
 
 Claude Code (`type:"user"` records, text blocks; attachments):
+0. Text blocks that contain `<system-reminder>` and would classify as a prompt or reminder are split first;
+   each remaining chunk is classified on its own (so a reminder prepended to a typed prompt does not hide it).
 1. `isCompactSummary` or "This session is being continued..." -> `compaction_summary`
 2. `[Request interrupted by user...]` -> `interrupt_marker` (+ `interrupt` event)
 3. `<command-name>`/`<command-message>` -> `human_command` (`/name args`) unless `isMeta` (-> `command_expansion`)
@@ -102,15 +128,19 @@ Claude Code (`type:"user"` records, text blocks; attachments):
 8. `<codex_internal_context source="goal"`, `[SYSTEM DIRECTIVE:` -> `auto_continuation`;
    `<agentryx_inbox_injection>`, `[AGENTRYX TEAM CHANNEL MESSAGE BATCH]` -> `relayed_prompt`;
    `[search-mode]`, `[analyze-mode]`, other `<codex_internal_context` -> `command_expansion`
-9. `isMeta` -> `command_expansion` (skill bodies) or `meta`
-10. `origin.kind=peer` -> `peer_message`; `auto-continuation` -> `auto_continuation`
+9. `origin.kind=peer|coordinator` -> `peer_message`; `auto-continuation` -> `auto_continuation` (checked before
+   isMeta: these records are also isMeta)
+10. `isMeta` -> `command_expansion` (skill bodies) or `meta`
 11. Known injection tags (`<environment_context>`, AGENTS.md, `<user_instructions>`, plugin/app/skill lists...) -> `context_injection`
 12. Subagent/sidechain transcript -> `agent_prompt`
 13. `origin.kind=human` -> `human`; other unknown origin kinds -> `meta`
-14. `promptSource=sdk` without human origin, or `sdk-*` entrypoint -> `sdk_prompt`
+14. `promptSource=system` without a more specific marker -> `meta`; `promptSource=sdk` without human origin,
+    or `sdk-*` entrypoint -> `sdk_prompt`
 15. otherwise -> `human`
 Attachments `queued_command` with human origin (typed while the model was busy) -> `human`, dropped
 when the identical text was also delivered as a user record. `tool_result` blocks -> `tool_output`.
+Hook attachments with content (SessionStart hook stdout, `hook_additional_context`, `hook_system_message`)
+-> `hook_output`.
 
 Codex (`response_item` message role=user, plus `event_msg:user_message` / `item_completed:UserMessage`):
 `<turn_aborted>` -> `interrupt_marker`; `<user_shell_command>` -> `human_shell`; notifications -> `task_notification`;
@@ -119,7 +149,9 @@ Codex (`response_item` message role=user, plus `event_msg:user_message` / `item_
 subagent thread (`session_meta.source.subagent`, `thread_source=subagent`, agent role/nickname) -> `agent_prompt`;
 non-interactive source (`exec`, `mcp`, custom/internal) -> `sdk_prompt`; otherwise `human`.
 Developer-role messages -> `developer`. The same message recorded as `response_item`, `event_msg` and
-`item_completed` is paired by content hash and stored once (the `origin` column says which copy was kept).
+`item_completed` is stored once: per content hash, a copy is kept only when its source has seen more copies
+than were already kept (so a genuinely repeated prompt is kept twice); reasoning summaries are paired part by
+part (events carry one part each). The `origin` column says which copy was kept.
 
 Session `origin_class`: `interactive` (Claude cli/desktop/vscode, Codex cli/vscode/Desktop), `noninteractive`
 (Claude `sdk-*` entrypoints, Codex exec/mcp), `subagent`, `imported` (only copied content), `unknown`.
@@ -168,7 +200,26 @@ Filters (sessions/search/stats): `--provider --project --cwd --alias --since --u
 ## Adding a source (e.g. Orca metadata)
 
 Add a module in `sessionindex/adapters/` exposing `PROVIDER`, `discover(root)`, `parse(job)`,
-`probe_last_ts(path)`, `home_metadata(root)`; register it in `adapters/__init__.py`; add a root entry to
-`sources.json`. Metadata-only adapters can return `None` from `discover` and write `aliases`/`links`/`facts`
-keyed by provider session id (join keys: Claude sessionId, Codex thread id, cwd/worktree path). No schema
-change is needed: `facts` is a generic key/value table.
+`probe_last_ts(path)`, `home_metadata(root)` (optional `home_files(root)` for change detection); register it
+in `adapters/__init__.py`; add a root entry to `sources.json`. Metadata-only adapters can return nothing from
+`discover` and write `aliases`/`links`/`facts`/`events` keyed by `(provider, provider session id)`.
+Join keys available for extra per-session link tables: `sessions.pid` (Claude sessionId, Codex thread id),
+`sessions.cwd_key` (lower-cased normalized cwd; indexed), `sessions.project_root` (derived main repo for
+git worktrees) and `files.path`. New tables can be added with `CREATE TABLE IF NOT EXISTS` in `schema.py`
+without touching existing ones; changing an existing table needs a `SCHEMA_VERSION` bump, after which
+ingest refuses to run until `sx ingest --rebuild` (annotations live in a separate DB and survive).
+
+## Verification (2026-09-27)
+
+* `python tools/selftest.py`: synthetic classification cases, bad-line/partial-tail tolerance, and on real
+  files per adapter a two-step append parse that must equal one full parse (all PASS).
+* `python tools/spotcheck.py --sid ...`: independent raw reader vs index on 20 sessions (10 Claude: interactive,
+  subagent, compaction, interrupt, parent-with-children; 10 Codex: interactive, subagent, compaction,
+  interrupt, exec): 0 mismatches after fixes (Claude human 554/554, Codex typed prompts 94/94, tool calls,
+  interrupts, compactions, titles, first/last timestamps).
+* `python tools/validate_human.py` on the full parse (before the queued-notification fix): typed-prompt
+  recall as human 96.4% (Claude, 4,093 logged prompts) and 91.2% (Codex, 7,366); unmatched typed prompts are
+  local commands or entries absent from every copy of the transcript (403-sample: 0 found only in a
+  non-canonical copy). Share of human messages found in typed logs: Codex TUI 97.7%; Claude CLI 66% before /
+  ~94% expected after removing 1,634 queued `<task-notification>` attachments that had been counted as human.
+  Desktop apps do not write typed-prompt logs, so their share is not a precision measure.

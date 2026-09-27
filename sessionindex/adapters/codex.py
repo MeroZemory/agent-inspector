@@ -14,7 +14,7 @@ import re
 import sqlite3
 
 from ..classify import codex_user_text_kind
-from ..util import norm_ts, jdump, text_hash, ms_to_iso
+from ..util import iso_to_epoch, norm_ts, jdump, text_hash, ms_to_iso
 from .base import Candidate, ParseOut, read_lines
 
 PROVIDER = "codex"
@@ -23,6 +23,8 @@ HDR = re.compile(rb'^\{"timestamp":"([^"]*)",(?:"ordinal":(\d+),)?"type":"([a-z_
 ITEM_TYPE = re.compile(rb'"item":\{"type":"([A-Za-z]+)"')
 FAIL_STATUS = re.compile(rb'"status":"(failed|declined)"')
 
+# originators that drive Codex programmatically (their user-role prompts are not typed by a person)
+PROGRAMMATIC_ORIGINATORS = ("codex_exec", "codex_sdk_ts", "agentryx-runner", "agentryx-probe")
 SKIP_TYPES = {"world_state", "token_usage_record", "inter_agent_communication_metadata"}
 SKIP_EVENTS = {
     "exec_command_output_delta", "agent_message_content_delta", "agent_message_delta", "agent_reasoning_delta",
@@ -39,6 +41,7 @@ SKIP_EVENTS = {
 UNION_ITEMS = {"AgentMessage", "UserMessage", "Reasoning"}
 TOOL_ERR_RE = re.compile(r"^(?:Exit code: (-?\d+)|Script failed|collab spawn failed|Process exited with code (-?\d+))")
 ABORT_RE = re.compile(r"^aborted by user")
+IMAGE_MARKUP_RE = re.compile(r"<image\b[^>]*>|</image>|\[image\]")
 LIMIT_RE = re.compile(r"usage limit|rate limit|rate_limit|429|quota|too many requests", re.I)
 
 
@@ -99,11 +102,14 @@ def _content_text(content) -> str:
     if isinstance(content, list):
         for b in content:
             if isinstance(b, dict):
-                t = b.get("type")
+                # response_item blocks use snake_case types; item_completed blocks use "Text"/"Image"
+                t = str(b.get("type") or "").lower()
                 if t in ("input_text", "output_text", "text", "summary_text", "reasoning_text"):
                     parts.append(b.get("text") or "")
-                elif t in ("input_image", "image"):
+                elif "image" in t:
                     parts.append("[image]")
+                elif isinstance(b.get("text"), str):
+                    parts.append(b["text"])
                 else:
                     parts.append(json.dumps(b, ensure_ascii=False)[:1000])
             else:
@@ -129,24 +135,47 @@ def _src_str(src) -> str:
     return str(src) if src is not None else ""
 
 
+def _user_key(text):
+    """Pairing hash for user prompts: response_item wraps images as '<image name=..>' + '</image>' blocks while
+    event/item copies append '[image]'; ignore image markup so the copies pair."""
+    return text_hash(IMAGE_MARKUP_RE.sub(" ", text or ""))
+
+
 class _Pairer:
-    """Pairs the same message recorded in several representations (response_item / event / item)."""
+    """Dedupes one message recorded in up to three representations (response_item / event / item).
+
+    Per content hash: emitted = copies kept so far; cnt[source] = copies seen from that source.
+    A copy is kept only when its source has now seen more copies than were kept, so a triple
+    (response_item + event + item) is stored once while a genuinely repeated text is stored again.
+    """
+
+    MAX = 400
 
     def __init__(self, saved=None):
-        self.recent = collections.deque(saved or [], maxlen=400)  # [h, source, matched]
+        self.d = collections.OrderedDict()
+        for ent in saved or []:
+            if isinstance(ent, list) and len(ent) == 3 and isinstance(ent[2], dict):
+                self.d[ent[0]] = [ent[1], dict(ent[2])]
 
     def seen_elsewhere(self, h, source) -> bool:
         if h is None:
             return False
-        for ent in self.recent:
-            if ent[0] == h and ent[1] != source and not ent[2]:
-                ent[2] = True
-                return True
-        self.recent.append([h, source, False])
+        ent = self.d.get(h)
+        if ent is None:
+            ent = self.d[h] = [0, {}]
+        else:
+            self.d.move_to_end(h)
+        c = ent[1].get(source, 0) + 1
+        ent[1][source] = c
+        if c <= ent[0]:
+            return True
+        ent[0] += 1
+        while len(self.d) > self.MAX:
+            self.d.popitem(last=False)
         return False
 
     def dump(self):
-        return list(self.recent)[-60:]
+        return [[h, e[0], e[1]] for h, e in list(self.d.items())[-200:]]
 
 
 def parse(job) -> dict:
@@ -166,12 +195,20 @@ def parse(job) -> dict:
     tid = st.get("tid")
     is_sub = st.get("is_sub", False)
     nonint = st.get("nonint", False)
-    compact_turn = st.get("compact_turn")
+    cmp_t = st.get("cmp_t")  # epoch of the last `compacted` record
     rate_max = st.get("rate_max")
+
+    def dup_parts(parts, source) -> bool:
+        """Reasoning summaries arrive as one event per part but as a part list in response_item/item:
+        pair part by part; the joined text is a duplicate only if every part was already stored."""
+        parts = [p for p in parts if p and p.strip()]
+        if not parts:
+            return True
+        return all([pair.seen_elsewhere(text_hash(p), source) for p in parts])
 
     def emit_user(ts, text, source, off, ln, origin=None):
         k = codex_user_text_kind(text, is_sub=is_sub, noninteractive=nonint)
-        h = text_hash(text)
+        h = _user_key(text)
         if source != "response_item" and k in ("context_injection", "system_reminder"):
             return
         if pair.seen_elsewhere(h, source):
@@ -254,7 +291,9 @@ def parse(job) -> dict:
                 thread_src = pl.get("thread_source")
                 is_sub = s_str.startswith("subagent") or thread_src == "subagent" or bool(pl.get("agent_role")) \
                     or bool(pl.get("agent_nickname"))
-                nonint = (not is_sub) and (s_str in ("exec", "mcp") or s_str.startswith(("custom", "internal")))
+                orig = str(pl.get("originator") or "")
+                nonint = (not is_sub) and (s_str in ("exec", "mcp") or s_str.startswith(("custom", "internal"))
+                                           or orig in PROGRAMMATIC_ORIGINATORS or orig.startswith("probe"))
                 st["is_sub"] = is_sub
                 st["nonint"] = nonint
                 git = pl.get("git") or {}
@@ -293,9 +332,8 @@ def parse(job) -> dict:
             msgtxt = pl.get("message") or ""
             if msgtxt:
                 out.msg(ts, "system", "compaction_summary", msgtxt, off=off, line=this_line, count_turn=False)
-            if compact_turn != (st.get("turn_id") or ts):
-                out.ev(ts, "compaction", f"window={pl.get('window_number')}", off=off)
-            compact_turn = st.get("turn_id") or ts
+            out.ev(ts, "compaction", f"window={pl.get('window_number')}", off=off)
+            cmp_t = iso_to_epoch(ts)
             continue
 
         # ------------------------------------------------------------ response_item
@@ -332,7 +370,7 @@ def parse(job) -> dict:
                     for k, t in groups:
                         if k is None:
                             k = "agent_prompt" if is_sub else ("sdk_prompt" if nonint else "human")
-                        h = text_hash(t)
+                        h = _user_key(t)
                         if k not in ("context_injection", "system_reminder") and pair.seen_elsewhere(h, "response_item"):
                             continue
                         out.msg(ts, "user", k, t, off=off, line=this_line, origin="response_item")
@@ -344,12 +382,14 @@ def parse(job) -> dict:
                     out.msg(ts, role or "system", "system", _content_text(content), off=off, line=this_line,
                             count_turn=False)
             elif it == "reasoning":
-                summ = _content_text(pl.get("summary"))
-                if not summ.strip():
+                sm = pl.get("summary")
+                parts = [b.get("text") or "" for b in sm if isinstance(b, dict)] if isinstance(sm, list) else []
+                if not any(p.strip() for p in parts):
                     cont = pl.get("content")
-                    summ = _content_text(cont) if isinstance(cont, list) else ""
-                if summ.strip() and not pair.seen_elsewhere(text_hash(summ), "response_item"):
-                    out.msg(ts, "assistant", "reasoning", summ, off=off, line=this_line, model=st.get("model"))
+                    parts = [_content_text(cont)] if isinstance(cont, list) else []
+                if not dup_parts(parts, "response_item"):
+                    out.msg(ts, "assistant", "reasoning", "\n".join(p for p in parts if p.strip()), off=off,
+                            line=this_line, model=st.get("model"))
             elif it in ("function_call", "custom_tool_call", "local_shell_call", "web_search_call",
                         "image_generation_call", "tool_search_call"):
                 name = pl.get("name") or {"local_shell_call": "local_shell", "web_search_call": "web_search",
@@ -460,9 +500,10 @@ def parse(job) -> dict:
             elif et == "thread_rolled_back":
                 out.ev(ts, "rollback", None, pl.get("num_turns"), off=off)
             elif et == "context_compacted":
-                if compact_turn != (st.get("turn_id") or ts):
+                t_now = iso_to_epoch(ts)
+                # newer Codex writes `compacted` then `context_compacted` for the same compaction
+                if cmp_t is None or t_now is None or abs(t_now - cmp_t) > 60:
                     out.ev(ts, "compaction", "context_compacted", off=off)
-                compact_turn = st.get("turn_id") or ts
             elif et == "thread_goal_updated":
                 g = pl.get("goal") or {}
                 out.ev(ts, "goal_status", f"{g.get('status', '')}: {str(g.get('objective') or '')[:300]}", off=off)
@@ -502,10 +543,10 @@ def parse(job) -> dict:
                         emit_user(ts, txt, "item", off, this_line)
                 elif itype == "Reasoning":
                     s = item.get("summary_text")
-                    txt = "\n".join(s) if isinstance(s, list) else (s or "")
-                    if txt.strip() and not pair.seen_elsewhere(text_hash(txt), "item"):
-                        out.msg(ts, "assistant", "reasoning", txt, off=off, line=this_line, model=st.get("model"),
-                                origin="item")
+                    parts = [str(x) for x in s] if isinstance(s, list) else [s or ""]
+                    if not dup_parts(parts, "item"):
+                        out.msg(ts, "assistant", "reasoning", "\n".join(p for p in parts if p.strip()), off=off,
+                                line=this_line, model=st.get("model"), origin="item")
                 elif itype in ("CommandExecution", "McpToolCall", "FileChange"):
                     status = item.get("status")
                     what = item.get("command") or item.get("tool") or item.get("changes")
@@ -521,7 +562,7 @@ def parse(job) -> dict:
     if len(calls) > 400:
         st["calls"] = dict(list(calls.items())[-400:])
     st["lines"] = line_no
-    st["compact_turn"] = compact_turn
+    st["cmp_t"] = cmp_t
     st["rate_max"] = rate_max
     meta.update({"models": dict(models), "first_ts": first_ts, "last_ts": last_ts,
                  "ctx_window": st.get("ctx_window"), "rate_max_primary_pct": rate_max})
@@ -532,6 +573,15 @@ def parse(job) -> dict:
 
 def _ro(path):
     return sqlite3.connect("file:" + path.replace("\\", "/") + "?mode=ro", uri=True, timeout=10)
+
+
+HOME_FILES = ("session_index.jsonl", "history.jsonl", "state_5.sqlite", "state_5.sqlite-wal",
+              "thread_history_1.sqlite", "thread_history_1.sqlite-wal", "goals_1.sqlite", "goals_1.sqlite-wal",
+              "external_agent_session_imports.json")
+
+
+def home_files(root):
+    return [os.path.join(root.path, f) for f in HOME_FILES]
 
 
 def home_metadata(root) -> dict:

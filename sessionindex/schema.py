@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sqlite3
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 INDEX_DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS files(
   root_id TEXT, provider TEXT, pkey TEXT, sid TEXT, subkind TEXT,
   size INTEGER, mtime_ns INTEGER, dev TEXT, ino TEXT, nlink INTEGER,
   role TEXT, relation TEXT,
-  first_ts TEXT, last_ts TEXT, probe_size INTEGER, probe_mtime_ns INTEGER,
+  first_ts TEXT, last_ts TEXT, probe_size INTEGER, probe_mtime_ns INTEGER, probe_lines INTEGER,
   parsed_offset INTEGER, parsed_size INTEGER, parsed_mtime_ns INTEGER, head_sha TEXT,
   n_lines INTEGER, n_bad INTEGER, partial_tail INTEGER, state TEXT,
   seen_run INTEGER, missing INTEGER DEFAULT 0, error TEXT);
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS sessions(
   parent_sid TEXT, parent_pid TEXT, agent_type TEXT, agent_name TEXT,
   client TEXT, source TEXT, origin_class TEXT,
   root_id TEXT, account TEXT, canonical_file_id INTEGER, n_files INTEGER, n_copies INTEGER,
-  cwd TEXT, project TEXT, project_root TEXT, project_method TEXT,
+  cwd TEXT, cwd_key TEXT, project TEXT, project_root TEXT, project_method TEXT,
   git_branch TEXT, git_origin TEXT, git_sha TEXT,
   cli_version TEXT, models TEXT, model TEXT,
   started_at TEXT, last_activity_at TEXT, duration_s REAL, active_s REAL,
@@ -45,6 +45,7 @@ CREATE INDEX IF NOT EXISTS sessions_last ON sessions(last_activity_at);
 CREATE INDEX IF NOT EXISTS sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS sessions_pid ON sessions(pid);
 CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(parent_sid);
+CREATE INDEX IF NOT EXISTS sessions_cwd_key ON sessions(cwd_key);
 
 CREATE TABLE IF NOT EXISTS messages(
   mid INTEGER PRIMARY KEY,
@@ -64,7 +65,7 @@ CREATE INDEX IF NOT EXISTS events_sid ON events(sid, seq);
 CREATE INDEX IF NOT EXISTS events_type ON events(type);
 
 CREATE TABLE IF NOT EXISTS aliases(
-  sid TEXT NOT NULL, alias TEXT, origin TEXT, manual INTEGER, ts TEXT, source TEXT,
+  sid TEXT NOT NULL, alias TEXT, origin TEXT, manual INTEGER, ts TEXT, source TEXT, current INTEGER,
   UNIQUE(sid, origin, alias));
 CREATE INDEX IF NOT EXISTS aliases_sid ON aliases(sid);
 
@@ -82,11 +83,23 @@ CREATE INDEX IF NOT EXISTS facts_sid ON facts(sid);
 CREATE TABLE IF NOT EXISTS prompt_history(
   sid TEXT, provider TEXT, pid TEXT, ts TEXT, text TEXT, project TEXT, source TEXT);
 CREATE INDEX IF NOT EXISTS prompt_history_sid ON prompt_history(sid);
+-- (source, sid) composites: fast per-root deletes AND per-session deletes (a bare source index would be
+-- picked for `sid=? AND source='transcript'` and scan every transcript row)
+DROP INDEX IF EXISTS events_source;
+DROP INDEX IF EXISTS aliases_source;
+DROP INDEX IF EXISTS links_source;
+DROP INDEX IF EXISTS facts_source;
+CREATE INDEX IF NOT EXISTS prompt_history_source ON prompt_history(source);
+CREATE INDEX IF NOT EXISTS events_source_sid ON events(source, sid);
+CREATE INDEX IF NOT EXISTS aliases_source_sid ON aliases(source, sid);
+CREATE INDEX IF NOT EXISTS links_source_sid ON links(source, src_sid);
+CREATE INDEX IF NOT EXISTS facts_source_sid ON facts(source, sid);
 
 CREATE VIEW IF NOT EXISTS fts_src AS SELECT mid, CASE
-  WHEN kind IN ('developer','context_injection','system_reminder','meta','command_expansion') THEN NULL
-  WHEN kind='tool_output' AND length(text)>1536 THEN substr(text,1,512)||' … '||substr(text,-1024)
-  WHEN kind='tool_call' AND length(text)>1024 THEN substr(text,1,1024)
+  WHEN kind IN ('developer','context_injection','system_reminder','meta','command_expansion','hook_output') THEN NULL
+  WHEN kind='tool_output' AND is_error=1 THEN text
+  WHEN kind='tool_output' AND length(text)>768 THEN substr(text,1,256)||' … '||substr(text,-512)
+  WHEN kind='tool_call' AND length(text)>512 THEN substr(text,1,512)
   ELSE text END AS text FROM messages;
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   text, content='fts_src', content_rowid='mid', tokenize='trigram');
@@ -120,7 +133,18 @@ def connect_rw(path: str) -> sqlite3.Connection:
     return con
 
 
+class SchemaMismatch(RuntimeError):
+    pass
+
+
 def init_index(con: sqlite3.Connection) -> None:
+    try:
+        row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row and row[0] != SCHEMA_VERSION:
+        raise SchemaMismatch(f"index.sqlite has schema {row[0]}, code expects {SCHEMA_VERSION}: "
+                             f"run `sx ingest --rebuild` (annotations are kept)")
     con.executescript(INDEX_DDL)
     con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (SCHEMA_VERSION,))
     con.commit()

@@ -11,6 +11,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -20,8 +21,8 @@ from . import projects
 from .adapters import ADAPTERS
 from .classify import HUMAN_KINDS
 from .config import ANN_PATH, DB_PATH, expand_roots, load_config
-from .schema import connect_rw, init_ann, init_index
-from .util import iso_to_epoch, jdump, now_iso, short_sid
+from .schema import SchemaMismatch, connect_rw, init_ann, init_index
+from .util import iso_to_epoch, jdump, norm_path, now_iso, short_sid
 
 ACTIVE_GAP_S = 1800
 
@@ -37,6 +38,20 @@ def head_sha(path: str) -> str | None:
             return hashlib.sha1(fh.read(4096)).hexdigest()
     except OSError:
         return None
+
+
+def count_lines(path: str) -> int:
+    n = 0
+    try:
+        with open(path, "rb") as fh:  # read-only
+            while True:
+                b = fh.read(1 << 22)
+                if not b:
+                    break
+                n += b.count(b"\n")
+    except OSError:
+        return -1
+    return n
 
 
 def run_job(job: dict) -> dict:
@@ -90,7 +105,10 @@ def discover(roots, cfg):
 # --------------------------------------------------------------------------- main
 
 def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: int | None = None,
-               max_jobs: int | None = None, quiet: bool = False) -> dict:
+               max_jobs: int | None = None, quiet: bool = False, reparse: bool = False,
+               reparse_sql: str | None = None, select: dict | None = None) -> dict:
+    """select (on-demand subset): {'sid': [...], 'file': [...], 'project': str, 'since': str, 'until': str}.
+    Only matching logical sessions are probed/parsed; everything else in the index is left untouched."""
     t_start = time.time()
     cfg = load_config()
     caps = cfg["caps"]
@@ -99,18 +117,24 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
             p = DB_PATH + suf
             if os.path.exists(p):
                 os.remove(p)
-        log("rebuild: removed index.sqlite (annotations.sqlite untouched)")
+        log(f"rebuild: removed {os.path.basename(DB_PATH)} (annotations.sqlite untouched)")
     con = connect_rw(DB_PATH)
-    init_index(con)
+    try:
+        init_index(con)
+    except SchemaMismatch as e:
+        con.close()
+        log(str(e))
+        return {"error": str(e)}
     acon = connect_rw(ANN_PATH)
     init_ann(acon)
     acon.close()
 
     run_id = con.execute("INSERT INTO ingest_runs(started_at,args) VALUES(?,?)",
-                         (now_iso(), jdump({"source": source, "rebuild": rebuild, "max_jobs": max_jobs}))).lastrowid
+                         (now_iso(), jdump({"source": source, "rebuild": rebuild, "reparse": reparse, "reparse_sql": reparse_sql,
+                                "max_jobs": max_jobs, "select": select}))).lastrowid
     con.commit()
 
-    roots = expand_roots(cfg)
+    roots = all_roots = expand_roots(cfg)
     if source:
         want = [s.lower() for s in source]
         roots = [r for r in roots if any(w in (r.adapter.lower(), r.root_id.lower(), r.label.lower(),
@@ -150,7 +174,7 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
     con.commit()
     fid = {row[0]: row for row in con.execute(
         "SELECT path,file_id,probe_size,probe_mtime_ns,first_ts,last_ts,parsed_offset,parsed_size,parsed_mtime_ns,"
-        "head_sha,state,n_lines,n_bad FROM files WHERE seen_run=?", (run_id,))}
+        "head_sha,state,n_lines,n_bad,probe_lines FROM files WHERE seen_run=?", (run_id,))}
 
     # ---- group by logical session and collapse hardlinks
     groups = collections.defaultdict(list)
@@ -158,16 +182,55 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
         prov = ADAPTERS[root.adapter].PROVIDER
         groups[(prov, c.pkey)].append({"root": root, "c": c, "size": size, "mtime": mtime, "unit": (dev, ino),
                                        "nlink": nlink, "row": fid[c.path]})
+    # a physical file (st_dev, st_ino) belongs to exactly one logical session: when the same unit is reachable
+    # under several logical keys (e.g. Claude workflow-agent transcripts hardlinked into two parent session
+    # dirs), the adapter's owner_pkey() picks the owner (Claude: sessionId inside the file) and the other
+    # paths are kept as provenance (role=hardlink) of that owner.
+    unit_keys = collections.defaultdict(set)
+    for key, ents in groups.items():
+        for e in ents:
+            unit_keys[e["unit"]].add(key)
+    n_moved = 0
+    for unit, keys in unit_keys.items():
+        if len(keys) < 2:
+            continue
+        keys = sorted(keys)
+        ents_u = [e for k in keys for e in groups[k] if e["unit"] == unit]
+        fn = getattr(ADAPTERS[ents_u[0]["root"].adapter], "owner_pkey", None)
+        pk = fn(ents_u[0]["c"].path, [k[1] for k in keys]) if fn else None
+        owner = (keys[0][0], pk) if pk and (keys[0][0], pk) in keys else keys[0]
+        for k in keys:
+            if k != owner:
+                moved = [e for e in groups[k] if e["unit"] == unit]
+                groups[k] = [e for e in groups[k] if e["unit"] != unit]
+                groups[owner].extend(moved)
+                n_moved += len(moved)
+    for k in [k for k, v in groups.items() if not v]:
+        del groups[k]
+    if n_moved:
+        log(f"{n_moved} paths reachable under several logical keys were assigned to one owner session")
     log(f"{len(stats)} files -> {len(groups)} logical sessions")
+    select = {k: v for k, v in (select or {}).items() if v}
+    if select:
+        groups = _select_groups(groups, select)
+        log(f"selection {jdump(select)} -> {len(groups)} logical sessions")
 
     sess_prev = {row[0]: row for row in con.execute("SELECT sid, canonical_file_id FROM sessions")}
+    reparse_set = set()
+    if reparse_sql:  # e.g. sessions affected by a classifier change
+        reparse_set = {r[0] for r in con.execute(reparse_sql)}
+        log(f"reparse-sql selected {len(reparse_set)} sessions")
 
-    # probe multi-unit groups (head/tail timestamps) to select the canonical copy
+    # probe multi-unit groups (head/tail timestamps) to select the canonical copy.
+    # Only one representative per (st_dev, st_ino) content unit is ever opened.
     to_probe = []
+    multi_reps = {}
     for key, ents in groups.items():
         units = {e["unit"] for e in ents}
         if len(units) > 1:
-            for e in _unit_reps(ents, sess_prev.get(short_sid(*key))):
+            reps = _unit_reps(ents, sess_prev.get(short_sid(*key)))
+            multi_reps[key] = reps
+            for e in reps:
                 r = e["row"]
                 if r[2] == e["size"] and r[3] == e["mtime"] and r[5]:
                     e["probe"] = (r[4], r[5])
@@ -181,10 +244,34 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
         with ThreadPoolExecutor(16) as ex:
             for e, pr in ex.map(_p, to_probe):
                 e["probe"] = pr
-        con.executemany("UPDATE files SET first_ts=?,last_ts=?,probe_size=?,probe_mtime_ns=? WHERE file_id=?",
+        con.executemany("UPDATE files SET first_ts=?,last_ts=?,probe_size=?,probe_mtime_ns=?,probe_lines=NULL "
+                        "WHERE file_id=?",
                         [(e["probe"][0], e["probe"][1], e["size"], e["mtime"], e["row"][1]) for e in to_probe])
         con.commit()
         log(f"probed {len(to_probe)} copies in {time.time() - t0:.1f}s")
+    # canonical rule: latest last-record timestamp, then MORE LINES, then lowest root rank.
+    # Line counts are only needed where the latest timestamp is tied; cached per (size, mtime).
+    probed = {id(e) for e in to_probe}
+    to_count = []
+    for key, reps in multi_reps.items():
+        top = max(_last(e) for e in reps)
+        tied = [e for e in reps if _last(e) == top]
+        if len(tied) > 1:
+            for e in tied:
+                r = e["row"]
+                if id(e) not in probed and r[2] == e["size"] and r[3] == e["mtime"] and r[13] is not None:
+                    e["lines"] = r[13]
+                else:
+                    to_count.append(e)
+    if to_count:
+        t0 = time.time()
+        with ThreadPoolExecutor(8) as ex:
+            for e, n in zip(to_count, ex.map(lambda e: count_lines(e["c"].path), to_count)):
+                e["lines"] = n
+        con.executemany("UPDATE files SET probe_lines=? WHERE file_id=?", [(e["lines"], e["row"][1]) for e in to_count])
+        con.commit()
+        log(f"counted lines of {len(to_count)} tied copies ({sum(e['size'] for e in to_count) / 1e9:.1f} GB) "
+            f"in {time.time() - t0:.1f}s")
 
     # ---- plan
     jobs = []
@@ -198,15 +285,16 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
         if len(reps) == 1:
             canon = reps[0]
         else:
-            canon = max(reps, key=lambda e: ((e.get("probe") or (None, None))[1] or "", e["size"], -e["root"].rank))
-        cl = (canon.get("probe") or (None, None))[1]
+            canon = max(reps, key=lambda e: (_last(e), e.get("lines", -1), -e["root"].rank, e["size"]))
+        unit_last = {e["unit"]: _last(e) for e in reps}  # probe results live on each unit's representative
+        cl = unit_last.get(canon["unit"])
         for e in ents:
             if e is canon:
                 continue
             if e["unit"] == canon["unit"]:
                 role_updates.append(("hardlink", "hardlink_of_canonical", sid, e["row"][1]))
             else:
-                pl = (e.get("probe") or (None, None))[1]
+                pl = unit_last.get(e["unit"])
                 rel = "unknown_extent" if not (pl and cl) else (
                     "same_extent" if pl == cl else ("older_extent" if pl < cl else "newer_extent"))
                 role_updates.append(("copy", rel, sid, e["row"][1]))
@@ -216,7 +304,7 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
         r = canon["row"]
         file_id = r[1]
         mode = None
-        if rebuild or prev is None or prev[1] != file_id:
+        if rebuild or reparse or sid in reparse_set or prev is None or prev[1] != file_id:
             mode = "full"
         elif r[7] == canon["size"] and r[8] == canon["mtime"]:
             mode = None
@@ -293,37 +381,88 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
     con.commit()
     log(f"parsed {len(jobs)} jobs in {time.time() - t0:.1f}s")
 
+    # sessions that no longer have any file: every file was deleted from disk or re-assigned to another owner.
+    # Only sessions whose files all lie in roots scanned by this run are considered.
+    scanned = {r.root_id for r in roots}
+    live = {short_sid(*k) for k in groups}
+    stale = []
+    for (sid,) in ([] if (select or max_jobs is not None) else con.execute("SELECT sid FROM sessions").fetchall()):
+        if sid in live:
+            continue
+        rids = {r[0] for r in con.execute("SELECT DISTINCT root_id FROM files WHERE sid=?", (sid,))}
+        if rids <= scanned:
+            stale.append(sid)
+    for sid in stale:
+        _delete_session_content(con, sid, fts_mark)
+        con.execute("DELETE FROM sessions WHERE sid=?", (sid,))
+    if stale:
+        con.commit()
+        log(f"removed {len(stale)} sessions whose files are gone or were re-assigned")
+        stats_run["sessions_removed"] = len(stale)
+
     # sessions whose group changed shape but content did not still need their file-count columns refreshed
     for sid, gi in group_info.items():
         if sid not in touched:
             con.execute("UPDATE sessions SET n_files=?, n_copies=? WHERE sid=?", (gi["n_files"], gi["n_units"] - 1, sid))
     con.commit()
 
-    # ---- per-root home metadata
+    # ---- per-root home metadata. Processed per adapter as one unit over ALL of that adapter's roots
+    # (rows duplicated across homes are stored once, so a partial refresh could drop a row another home
+    # still has). Skipped when no metadata file of any of those roots changed size/mtime.
     t0 = time.time()
-    for r in roots:
-        ad = ADAPTERS[r.adapter]
-        try:
-            hm = ad.home_metadata(r)
-        except Exception:
-            log(f"home metadata failed for {r.root_id}: {traceback.format_exc()[-300:]}")
-            continue
-        if hm:
-            _write_home(con, r, hm, stats_run)
-    con.commit()
-    log(f"home metadata in {time.time() - t0:.1f}s")
+    n_skip = 0
+    for adapter in sorted({r.adapter for r in roots}):
+        ad = ADAPTERS[adapter]
+        hroots = [r for r in all_roots if r.adapter == adapter]
+        sigs = [_home_sig(ad, r) for r in hroots]
+        sig = None if any(x is None for x in sigs) else hashlib.sha1("|".join(sigs).encode()).hexdigest()
+        key = f"home_sig:{adapter}"
+        if sig and not rebuild:
+            row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            if row and row[0] == sig:
+                n_skip += 1
+                continue
+        for t in ("aliases", "links", "facts", "events", "prompt_history"):
+            con.executemany(f"DELETE FROM {t} WHERE source=?", [(f"home:{r.root_id}",) for r in hroots])
+        for r in hroots:
+            try:
+                hm = ad.home_metadata(r)
+            except Exception:
+                log(f"home metadata failed for {r.root_id}: {traceback.format_exc()[-300:]}")
+                sig = None  # retry next run
+                continue
+            if hm:
+                _write_home(con, r, hm, stats_run)
+        con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, sig or ""))
+        con.commit()
+    log(f"home metadata in {time.time() - t0:.1f}s ({n_skip} adapters unchanged)")
 
-    # ---- finalize
+    # ---- finalize (also sessions left unfinalized by an interrupted earlier run: msgs_n IS NULL)
     t0 = time.time()
+    pending = {r[0] for r in con.execute("SELECT sid FROM sessions WHERE msgs_n IS NULL")}
+    if pending - touched:
+        log(f"finalize: {len(pending - touched)} sessions left unfinalized by an earlier run")
+    touched |= pending
     _finalize(con, touched, group_info, root_by_id)
     log(f"finalize {len(touched)} sessions in {time.time() - t0:.1f}s")
 
+    # ---- FTS: committed in mid batches so an interrupted run resumes where it stopped
     t0 = time.time()
     new_mark = con.execute("SELECT COALESCE(MAX(mid),0) FROM messages").fetchone()[0]
-    con.execute("INSERT INTO messages_fts(rowid,text) SELECT mid,text FROM fts_src WHERE mid>? AND text IS NOT NULL",
-                (fts_mark,))
-    con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('fts_max_mid',?)", (str(new_mark),))
-    con.commit()
+    lo = fts_mark
+    last_log = time.time()
+    while lo < new_mark:
+        hi = min(lo + 50000, new_mark)
+        con.execute("INSERT INTO messages_fts(rowid,text) SELECT mid,text FROM fts_src "
+                    "WHERE mid>? AND mid<=? AND text IS NOT NULL", (lo, hi))
+        con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('fts_max_mid',?)", (str(hi),))
+        con.commit()
+        lo = hi
+        if not quiet and time.time() - last_log > 30:
+            el = time.time() - t0
+            done = (lo - fts_mark) / max(1, new_mark - fts_mark)
+            log(f"fts {lo}/{new_mark} mids ({done * 100:.0f}%), eta {el / max(done, 1e-9) * (1 - done) / 60:.1f} min")
+            last_log = time.time()
     log(f"fts indexed mids {fts_mark}..{new_mark} in {time.time() - t0:.1f}s")
 
     stats_run["wall_s"] = round(time.time() - t_start, 1)
@@ -334,6 +473,59 @@ def run_ingest(source: list[str] | None = None, rebuild: bool = False, workers: 
     con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     con.close()
     return dict(stats_run)
+
+
+_HEAD_CWD = re.compile(rb'"cwd":"((?:[^"\\]|\\.)*)"')
+_HEAD_TS = re.compile(rb'"timestamp":"([^"]+)"')
+
+
+def _head(path: str) -> tuple[str | None, str | None]:
+    """(cwd, first timestamp) from the first 64 KB of a transcript (read-only)."""
+    try:
+        with open(path, "rb") as fh:
+            b = fh.read(65536)
+    except OSError:
+        return None, None
+    m = _HEAD_CWD.search(b)
+    cwd = None
+    if m:
+        try:
+            cwd = json.loads(b'"' + m.group(1) + b'"')
+        except ValueError:
+            cwd = m.group(1).decode("utf-8", "replace")
+    t = _HEAD_TS.search(b)
+    return cwd, (t.group(1).decode() if t else None)
+
+
+def _select_groups(groups, sel):
+    """Keep logical sessions matching every given selector (cheap checks first; heads read only if needed)."""
+    ids = [x.strip().lower() for x in sel.get("sid") or [] if x.strip()]
+    files = {(norm_path(os.path.abspath(f)) or "").lower() for f in sel.get("file") or []}
+    proj = (sel.get("project") or "").lower().replace("\\", "/")
+    since = iso_to_epoch(sel["since"] + ("T00:00:00+00:00" if len(sel["since"]) <= 10 else "")) if sel.get("since") else None
+    until = sel.get("until")
+    out = {}
+    for key, ents in groups.items():
+        sid = short_sid(*key)
+        if ids and not any(sid.startswith(i) or (len(i) >= 6 and key[1].lower().startswith(i)) for i in ids):
+            continue
+        if files and not any((norm_path(e["c"].path) or "").lower() in files for e in ents):
+            continue
+        if since is not None and max(e["mtime"] for e in ents) / 1e9 < since:
+            continue
+        if proj or until:
+            cwd, first = _head(ents[0]["c"].path)
+            if proj and proj not in (norm_path(cwd) or "").lower() and \
+                    not any(proj.replace("/", "-").replace(":", "-") in e["c"].path.lower() for e in ents):
+                continue
+            if until and first and first >= until:
+                continue
+        out[key] = ents
+    return out
+
+
+def _last(e) -> str:
+    return (e.get("probe") or (None, None))[1] or ""
 
 
 def _unit_reps(ents, prev):
@@ -499,12 +691,14 @@ def _upsert_session(con, sid, res, job, gi):
         "agent_type": agent_type, "agent_name": agent_name, "client": client, "source": source,
         "origin_class": origin_class, "root_id": root.root_id, "account": root.label,
         "canonical_file_id": job["file_id"], "n_files": gi["n_files"], "n_copies": gi["n_units"] - 1,
-        "cwd": cwd, "project": proj, "project_root": proj_root, "project_method": method,
+        "cwd": cwd, "cwd_key": (norm_path(cwd) or "").lower() or None,
+        "project": proj, "project_root": proj_root, "project_method": method,
         "git_branch": merged.get("git_branch"), "git_origin": merged.get("git_origin"), "git_sha": merged.get("git_sha"),
         "cli_version": merged.get("cli_version"), "models": jdump(models), "model": model,
         "ctx_window": merged.get("ctx_window"), "out_tokens": outtok or None,
         "is_test": int(gi["is_test"]), "archived": archived, "rec_counts": jdump(rec), "parse_bad": bad,
         "meta": jdump(merged), "updated_at": now_iso(),
+        "msgs_n": None,  # NULL = aggregates pending; set by _finalize
     }
     cols = list(vals)
     con.execute(f"INSERT INTO sessions(sid,{','.join(cols)}) VALUES(?,{','.join('?' * len(cols))}) "
@@ -523,11 +717,23 @@ def _upsert_session(con, sid, res, job, gi):
                     (sid, "session_meta_id_mismatch", merged.get("pid"), "codex_session_meta", None))
 
 
+def _home_sig(ad, root) -> str | None:
+    """size/mtime signature of the files an adapter's home_metadata() reads (None = always re-read)."""
+    fn = getattr(ad, "home_files", None)
+    if fn is None:
+        return None
+    parts = []
+    for p in fn(root):
+        try:
+            st = os.stat(p)
+            parts.append(f"{p}:{st.st_size}:{st.st_mtime_ns}")
+        except OSError:
+            parts.append(f"{p}:-")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+
 def _write_home(con, root, hm, stats_run):
-    src = f"home:{root.root_id}"
-    for t, col in (("aliases", "source"), ("links", "source"), ("facts", "source"), ("events", "source"),
-                   ("prompt_history", "source")):
-        con.execute(f"DELETE FROM {t} WHERE {col}=?", (src,))
+    src = f"home:{root.root_id}"  # caller deleted this adapter's home rows before the first root was written
     _exec_rows(con, "INSERT INTO aliases(sid,alias,origin,manual,ts,source) VALUES(?,?,?,?,?,?) "
                     "ON CONFLICT(sid,origin,alias) DO UPDATE SET ts=COALESCE(excluded.ts,ts), source=excluded.source",
                     [(short_sid(a[0], a[1]), str(a[2])[:500], a[3], a[4], a[5], src) for a in hm.get("aliases", [])
@@ -569,10 +775,13 @@ def _finalize(con, touched, group_info, root_by_id):
     # inherited prefix marking for forks/imports (content identical to the link target's messages)
     con.execute("UPDATE messages SET inherited=0 WHERE sid IN (SELECT sid FROM touched) AND inherited<>0")
     pairs = con.execute("SELECT l.src_sid, l.dst_sid FROM links l JOIN touched t ON t.sid=l.src_sid "
-                        "WHERE l.rel IN ('forked_from','imported_from')").fetchall()
+                        "WHERE l.rel IN ('forked_from','imported_from') ORDER BY l.dst_sid").fetchall()
     n_inh = 0
+    ph_parent, ph = None, set()
     for child, parent in pairs:
-        ph = {r[0] for r in con.execute("SELECT h FROM messages WHERE sid=? AND h IS NOT NULL", (parent,))}
+        if parent != ph_parent:
+            ph = {r[0] for r in con.execute("SELECT h FROM messages WHERE sid=? AND h IS NOT NULL", (parent,))}
+            ph_parent = parent
         if not ph:
             continue
         mark = []
@@ -644,6 +853,16 @@ def _finalize(con, touched, group_info, root_by_id):
         " tool_errors=?, errors=?, interrupts=?, compactions=?, subagent_spawns=?, denials=?, events_n=?, msgs_n=?,"
         " inherited_msgs=?, max_ctx_tokens=?, started_at=?, last_activity_at=?, duration_s=?, active_s=?,"
         " first_prompt=? WHERE sid=?", ups)
+    # derived token pressure: first message of each turn whose context reached >= 90% of the reported window
+    # (Codex token_count.model_context_window; Claude transcripts do not record the window)
+    con.execute("DELETE FROM events WHERE source='derived' AND sid IN (SELECT sid FROM touched)")
+    con.execute(
+        "INSERT INTO events(sid,seq,ts,type,detail,value,file_id,offset,source) "
+        "SELECT m.sid, m.seq, m.ts, 'token_pressure', 'ctx '||x.mx||'/'||x.win||' tokens', ROUND(x.mx*1.0/x.win,3), "
+        "m.file_id, m.offset, 'derived' FROM (SELECT m.sid, m.turn, MIN(m.seq) seq, MAX(m.ctx_tokens) mx, "
+        "s.ctx_window win FROM messages m JOIN sessions s ON s.sid=m.sid WHERE m.sid IN (SELECT sid FROM touched) "
+        "AND s.ctx_window>0 AND m.inherited=0 AND m.ctx_tokens>=0.9*s.ctx_window GROUP BY m.sid, m.turn) x "
+        "JOIN messages m ON m.sid=x.sid AND m.seq=x.seq")
     # imported-only sessions
     con.execute("UPDATE sessions SET origin_class='imported' WHERE sid IN (SELECT sid FROM touched) "
                 "AND msgs_n>0 AND inherited_msgs>=msgs_n")
@@ -654,9 +873,14 @@ def _finalize(con, touched, group_info, root_by_id):
     # archived via codex state facts
     con.execute("UPDATE sessions SET archived=1 WHERE sid IN (SELECT sid FROM facts WHERE key='state.archived' "
                 "AND value IN ('1','true'))")
+    # alias currency: per (session, origin) the latest-timestamped name is current (e.g. the last
+    # session_index.jsonl line across all CODEX_HOMEs, the latest ai-title/custom-title record)
+    con.execute("UPDATE aliases SET current=0")
+    con.execute("UPDATE aliases SET current=1 WHERE rowid IN (SELECT rid FROM (SELECT rowid rid, ROW_NUMBER() OVER "
+                "(PARTITION BY sid, origin ORDER BY COALESCE(ts,'') DESC, rowid DESC) rn FROM aliases) WHERE rn=1)")
     # titles for every session (aliases can change via home metadata without a reparse)
     best = {}
-    for sid, alias, origin, ts in con.execute("SELECT sid, alias, origin, ts FROM aliases"):
+    for sid, alias, origin, ts in con.execute("SELECT sid, alias, origin, ts FROM aliases WHERE current=1"):
         p = _TP.get(origin, 6)
         cur = best.get(sid)
         k = (p, "" if ts is None else ts)

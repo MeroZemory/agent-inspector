@@ -9,11 +9,12 @@ import json
 import os
 import re
 
-from ..classify import (claude_user_text_kind, slash_text, bash_text, split_system_reminders)
-from ..util import norm_ts, jdump, ms_to_iso
+from ..classify import claude_user_text_kind, classify_split, slash_text, bash_text
+from ..util import iso_to_epoch, norm_ts, jdump, ms_to_iso
 from .base import Candidate, ParseOut, read_lines
 
 PROVIDER = "claude"
+TOKENS_LEFT_RE = re.compile(r"<total_tokens>\s*(\d+)")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 AGENT_RE = re.compile(r"^agent-(.+)\.jsonl$")
 IMPORT_VERSIONS = ("codex-import", "pass-the-thread")
@@ -68,6 +69,21 @@ def _walk_subagents(sa_dir, parent_sid, slug, archived):
 
 def probe_last_ts(path):
     return _probe(path)
+
+
+def owner_pkey(path, pkeys):
+    """Owner among logical keys that reach the same physical file: the sessionId recorded inside it."""
+    try:
+        with open(path, "rb") as fh:
+            m = re.search(rb'"sessionId":"([^"]+)"', fh.read(65536))
+    except OSError:
+        return None
+    if m:
+        sid = m.group(1).decode("utf-8", "replace")
+        for k in pkeys:
+            if k.split(":", 1)[0] == sid:
+                return k
+    return None
 
 
 def _probe(path):
@@ -224,17 +240,16 @@ def parse(job) -> dict:
                         out.ev(ts, "tool_error", f"{tname}: {txt[:200]}", off=off)
                 elif bt == "text":
                     t = b.get("text") or ""
-                    k = claude_user_text_kind(t, is_meta=is_meta, is_compact=is_compact, okind=okind,
-                                              psrc=psrc, is_sub=is_sub, sdk_client=sdk_client)
-                    if k == "human_command":
-                        t = slash_text(t)
-                    elif k == "human_shell":
-                        t = bash_text(t)
-                    if k in ("human", "sdk_prompt", "agent_prompt") and "<system-reminder>" in t:
-                        for chunk, is_rem in split_system_reminders(t):
-                            pending_text.append(("system_reminder" if is_rem else k, chunk))
-                    else:
-                        pending_text.append((k, t))
+
+                    def _k(x):
+                        return claude_user_text_kind(x, is_meta=is_meta, is_compact=is_compact, okind=okind,
+                                                     psrc=psrc, is_sub=is_sub, sdk_client=sdk_client)
+                    for k, chunk in classify_split(t, _k):
+                        if k == "human_command":
+                            chunk = slash_text(chunk)
+                        elif k == "human_shell":
+                            chunk = bash_text(chunk)
+                        pending_text.append((k, chunk))
                 elif bt == "image":
                     pending_text.append(("image", "[image]"))
                 else:
@@ -366,8 +381,10 @@ def parse(job) -> dict:
                     prompt = _blocks_text(prompt)
                 if prompt:
                     if okind in (None, "human"):
-                        k = "human_shell" if a.get("commandMode") == "bash" else (
-                            "agent_prompt" if is_sub else "human")
+                        # queued text still goes through the content rules (queued <task-notification>s etc.)
+                        k = "human_shell" if a.get("commandMode") == "bash" else claude_user_text_kind(
+                            str(prompt), is_meta=False, is_compact=False, okind=okind, psrc=None, is_sub=is_sub,
+                            sdk_client=sdk_client)
                     elif okind == "task-notification":
                         k = "task_notification"
                     elif okind == "peer":
@@ -384,10 +401,36 @@ def parse(job) -> dict:
             elif at == "hook_cancelled":
                 out.ev(ts, "hook_timeout" if a.get("timedOut") else "hook_cancelled", a.get("hookName"),
                        a.get("durationMs"), off=off)
+            elif at == "hook_non_blocking_error":
+                out.ev(ts, "hook_error", f"{a.get('hookName')} exit={a.get('exitCode')}: "
+                                         f"{str(a.get('stderr') or a.get('stdout') or '')[:200]}", off=off)
+            elif at == "max_turns_reached":
+                out.ev(ts, "max_turns", f"{a.get('turnCount')}/{a.get('maxTurns')}", a.get("maxTurns"), off=off)
+            elif at == "total_tokens_reminder":
+                mt = TOKENS_LEFT_RE.search(str(a.get("text") or ""))
+                if mt:
+                    st["tokens_left"] = int(mt.group(1))
             elif at == "goal_status":
                 out.ev(ts, "goal_status", f"met={a.get('met')}: {str(a.get('condition') or '')[:300]}", off=off)
             elif at == "edited_text_file":
                 out.ev(ts, "external_file_edit", a.get("filename"), off=off)
+            if at in ("hook_success", "hook_additional_context", "hook_system_message"):
+                c = a.get("content")
+                c = _blocks_text(c) if isinstance(c, list) else (c if isinstance(c, str) else "")
+                if c.strip():
+                    out.msg(ts, "system", "hook_output", c, off=off, line=this_line, count_turn=False,
+                            origin=f"{at}:{a.get('hookName') or a.get('hookEvent') or ''}", imported=imported,
+                            sidechain=side)
+            if a.get("hookEvent") == "SessionStart" and a.get("hookName"):
+                src_kind = str(a.get("hookName")).split(":", 1)[-1]
+                prev_ss = st.get("last_ss") or [None, None]
+                t_now = iso_to_epoch(ts)
+                # several hooks fire per start: emit one event per (source, start)
+                if prev_ss[0] != src_kind or t_now is None or prev_ss[1] is None or abs(t_now - prev_ss[1]) > 10:
+                    typ_ev = {"resume": "resume", "clear": "context_clear", "startup": "session_start"}.get(src_kind)
+                    if typ_ev:
+                        out.ev(ts, typ_ev, f"SessionStart:{src_kind}", off=off)
+                    st["last_ss"] = [src_kind, t_now]
             continue
 
         out.rec_counts[str(typ)] += 1
@@ -411,6 +454,11 @@ def parse(job) -> dict:
                 st["perm"] = pm
         elif typ == "cost-state":
             out.fact("cost_usd", r.get("totalCostUSD"), "claude_cost_state", last_ts)
+        elif typ == "relocated":
+            out.ev(ts or last_ts, "relocated", r.get("relocatedCwd"), off=off)
+        elif typ == "fork-context-ref":
+            out.ev(ts or last_ts, "fork", f"context from {r.get('parentSessionId')} "
+                                          f"(contextLength={r.get('contextLength')})", off=off)
 
     # drop queued_command copies whose identical text was also delivered as a user record
     if queued_rows:
@@ -429,6 +477,7 @@ def parse(job) -> dict:
         "cwd": cwd, "git_branch": git_branch, "cli_version": version, "client": entrypoint,
         "user_type": user_type, "models": dict(models), "first_ts": first_ts, "last_ts": last_ts,
         "imported_versions": dict(imported_versions), "slug": ctx.get("slug"), "archived": ctx.get("archived"),
+        "tokens_left_last": st.get("tokens_left"),
     })
     return out.result(end_offset=end_off, n_lines=line_no, n_bad=n_bad, partial_tail=partial)
 
@@ -439,6 +488,10 @@ def _other_human_hashes(messages, queued_rows):
 
 
 # ---------------------------------------------------------------- per-root metadata
+
+def home_files(root):
+    return [os.path.join(root.path, f) for f in ("history.jsonl", "codex-import-history.json")]
+
 
 def home_metadata(root) -> dict:
     """~/.claude/history.jsonl (typed prompts) and codex-import-history.json (import links)."""

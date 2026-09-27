@@ -15,7 +15,7 @@ DB_PATH = os.environ.get("SX_DB") or os.path.join(DATA_DIR, "index.sqlite")
 ANN_PATH = os.environ.get("SX_ANN_DB") or os.path.join(DATA_DIR, "annotations.sqlite")
 SOURCES_PATH = os.environ.get("SX_SOURCES") or os.path.join(PROJECT_DIR, "sources.json")
 
-DEFAULT_CAPS = {"tool_output_chars": 4096, "tool_args_chars": 16384, "injected_chars": 4096}
+DEFAULT_CAPS = {"tool_output_chars": 4096, "tool_args_chars": 262144, "injected_chars": 4096}
 
 
 @dataclass

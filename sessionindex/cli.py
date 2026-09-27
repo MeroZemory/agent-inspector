@@ -216,7 +216,9 @@ def cmd_stats(a):
         tot = con.execute(f"SELECT COUNT(*), SUM(human_msgs), SUM(msgs_n), MIN(started_at), MAX(last_activity_at)"
                           f" FROM sessions s WHERE {base_w}", args).fetchone()
         o.emit({"sessions": tot[0], "human_msgs": tot[1], "messages": tot[2], "first": tot[3], "last": tot[4],
-                "db_mb": round(os.path.getsize(DB_PATH) / 1e6, 1)})
+                "db_mb": round(os.path.getsize(DB_PATH) / 1e6, 1),
+                "scope": f"subagents={a.subagents}, test_roots={'include' if a.include_test else 'exclude'}",
+                "all_sessions": con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]})
         for r in con.execute("SELECT stats, started_at, finished_at FROM ingest_runs WHERE finished_at IS NOT NULL "
                              "ORDER BY run_id DESC LIMIT 1"):
             o.emit({"last_ingest": r[2], "stats": json.loads(r[0] or "{}")})
@@ -245,6 +247,8 @@ def cmd_sessions(a):
                 d[k] = d[k][:16]
         if d.get("active_s") is not None:
             d["active_min"] = round(d.pop("active_s") / 60, 1)
+        if not a.fields:  # compact default: absent counter = 0/null
+            d = {k: v for k, v in d.items() if v not in (None, 0, "") or k in ("sid", "human_msgs")}
         o.emit(d)
     o.flush()
 
@@ -263,8 +267,15 @@ def cmd_show(a):
                               "subagent_spawns", "denials", "max_ctx_tokens", "ctx_window", "title", "title_origin",
                               "parent_sid", "agent_type", "agent_name", "n_files", "n_copies", "inherited_msgs")
             if s.get(k) not in (None, "", 0) or k in ("human_msgs", "sid")}
+    for k in ("duration_s", "active_s"):
+        if meta.get(k) is not None:
+            meta[k] = round(meta[k])
     meta["aliases"] = [{"alias": clip(r[0], 80), "origin": r[1], "manual": r[2]} for r in con.execute(
-        "SELECT alias, origin, manual FROM aliases WHERE sid=? ORDER BY origin", (sid,))][:12]
+        "SELECT alias, origin, manual FROM aliases WHERE sid=? AND current=1 ORDER BY manual DESC, origin",
+        (sid,))][:12]
+    older = con.execute("SELECT COUNT(*) FROM aliases WHERE sid=? AND COALESCE(current,0)=0", (sid,)).fetchone()[0]
+    if older:
+        meta["older_aliases"] = older  # superseded names: sx sql "SELECT * FROM aliases WHERE sid='..'"
     meta["events"] = {r[0]: r[1] for r in con.execute(
         "SELECT type, COUNT(*) FROM events WHERE sid=? GROUP BY type ORDER BY 2 DESC", (sid,))}
     meta["links"] = [{"rel": r[0], "dst": r[1], "dst_pid": r[2], "exists": bool(r[3])} for r in con.execute(
@@ -465,14 +476,12 @@ READONLY_RE = re.compile(r"^\s*(WITH|SELECT|EXPLAIN|PRAGMA\s+table_info|VALUES)\
 def cmd_sql(a):
     con = ro()
     o = Out(a.format)
-    q = a.query.strip().rstrip(";")
-    if ";" in q:
-        die("one statement only")
+    q = a.query.strip().rstrip(";").strip()
     if not READONLY_RE.match(q):
         die("read-only: only SELECT/WITH/EXPLAIN/VALUES/PRAGMA table_info statements are allowed")
     try:
-        cur = con.execute(q)
-    except sqlite3.Error as e:
+        cur = con.execute(q)  # sqlite3 itself refuses more than one statement
+    except (sqlite3.Error, sqlite3.Warning) as e:
         die(f"sql error: {e}")
     cols = [c[0] for c in cur.description] if cur.description else []
     n = 0
@@ -491,11 +500,12 @@ def cmd_note(a):
     sid = resolve(con, a.id)
     anchor = None
     if a.seq is not None:
-        r = con.execute("SELECT m.file_id, m.offset, s.pid FROM messages m JOIN sessions s ON s.sid=m.sid "
-                        "WHERE m.sid=? AND m.seq=?", (sid, a.seq)).fetchone()
+        r = con.execute("SELECT f.path, m.offset, s.pid FROM messages m JOIN sessions s ON s.sid=m.sid "
+                        "LEFT JOIN files f ON f.file_id=m.file_id WHERE m.sid=? AND m.seq=?", (sid, a.seq)).fetchone()
         if not r:
             die(f"seq {a.seq} not found in {sid}")
-        anchor = json.dumps({"pid": r[2], "file_id": r[0], "offset": r[1]})
+        # seq numbers can shift after a parser change; path + byte offset of the source line do not
+        anchor = json.dumps({"pid": r[2], "path": r[0], "offset": r[1]}, ensure_ascii=False)
     con.close()
     acon = connect_rw(ANN_PATH)
     init_ann(acon)
@@ -531,7 +541,9 @@ def cmd_notes(a):
 def cmd_ingest(a):
     from .ingest import run_ingest
     stats = run_ingest(source=a.source.split(",") if a.source else None, rebuild=a.rebuild, workers=a.workers,
-                       max_jobs=a.max_jobs)
+                       max_jobs=a.max_jobs, reparse=a.reparse, reparse_sql=a.reparse_sql,
+                       select={"sid": a.sid.split(",") if a.sid else None, "file": a.file,
+                               "project": a.project, "since": a.since, "until": a.until})
     sys.stdout.write(json.dumps(stats, ensure_ascii=False) + "\n")
 
 
@@ -618,7 +630,7 @@ def build_parser():
     s.add_argument("--with-copied", action="store_true")
     s.add_argument("--limit", type=int, default=20)
     s.add_argument("--offset", type=int, default=0)
-    s.add_argument("--tokens", type=int, default=16, help="snippet size in tokens")
+    s.add_argument("--tokens", type=int, default=48, help="snippet size in trigram tokens (~chars, max 64)")
     s.add_argument("--context", type=int, default=80, help="LIKE snippet context chars")
     s.set_defaults(fn=cmd_search)
 
@@ -648,6 +660,14 @@ def build_parser():
     s = sub.add_parser("ingest", help="incremental ingest (all sources by default)")
     s.add_argument("--source", help="comma list: claude,codex,cc_transcripts or root ids/labels")
     s.add_argument("--rebuild", action="store_true", help="drop index.sqlite and re-parse (annotations kept)")
+    s.add_argument("--reparse", action="store_true",
+                   help="re-parse every selected session in place (after classifier/adapter changes)")
+    s.add_argument("--reparse-sql", help="re-parse only the sessions whose sid this SELECT returns")
+    s.add_argument("--sid", help="on-demand: only these sessions (short sid or provider id prefix >=6, comma list)")
+    s.add_argument("--file", action="append", help="on-demand: only the session owning this transcript path (repeatable)")
+    s.add_argument("--project", help="on-demand: only sessions whose cwd (or Claude project dir) contains this")
+    s.add_argument("--since", help="on-demand: only sessions whose files changed on/after this UTC date (YYYY-MM-DD)")
+    s.add_argument("--until", help="on-demand: only sessions that started before this UTC date/time")
     s.add_argument("--workers", type=int)
     s.add_argument("--max-jobs", type=int, help="parse at most N sessions (evenly sampled) - for trials")
     s.set_defaults(fn=cmd_ingest)

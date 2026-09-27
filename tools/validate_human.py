@@ -46,6 +46,8 @@ def main():
         wrong = collections.Counter()
         miss_ex, fp_ex = [], []
         hm_tot = hm_match = 0
+        by_client = collections.defaultdict(lambda: [0, 0])
+        clients = dict(con.execute("SELECT sid, COALESCE(client,'?') FROM sessions WHERE provider=?", (prov,)))
         for sid in sids:
             msgs = con.execute("SELECT kind, text FROM messages WHERE sid=? AND inherited=0 AND role IN ('user','system')",
                                (sid,)).fetchall()
@@ -67,13 +69,17 @@ def main():
             for k, nk in by_kind:
                 if k in HUMAN and len(nk) >= 4:
                     hm_tot += 1
+                    by_client[clients.get(sid)][0] += 1
                     if nk in hset or any(x.startswith(nk) or nk.startswith(x) for x in hset if len(x) >= 8):
                         hm_match += 1
+                        by_client[clients.get(sid)][1] += 1
                     elif len(fp_ex) < a.examples:
                         fp_ex.append((sid, nk[:80]))
         res[prov] = {"sessions_with_history": len(sids), "history_prompts": tot, "recall_as_human": round(matched / tot, 4) if tot else None,
                      "history_prompts_not_human_by_kind": dict(wrong.most_common(8)),
                      "human_msgs": hm_tot, "human_msgs_found_in_history": round(hm_match / hm_tot, 4) if hm_tot else None}
+        res[prov]["found_in_history_by_client"] = {k: f"{v[1]}/{v[0]}" for k, v in
+                                                   sorted(by_client.items(), key=lambda x: -x[1][0])[:6]}
         print(prov, res[prov])
         for ex in miss_ex:
             print("  missed:", ex)

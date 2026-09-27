@@ -10,6 +10,7 @@ Usage: python tools/spotcheck.py [--n 5] [--sid SID ...]
 import argparse
 import collections
 import json
+import re
 import os
 import sqlite3
 import sys
@@ -18,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sessionindex.config import DB_PATH  # noqa: E402
 
 HUMAN = ("human", "human_command", "human_shell")
+IMG = re.compile(r"<image\b[^>]*>|</image>|\[image\]")  # image markup differs between Codex representations
 
 
 def db():
@@ -76,12 +78,20 @@ def raw_claude(path, is_sub):
                     c["asst_text"] += 1
         if t == "attachment" and (r.get("attachment") or {}).get("type") == "queued_command":
             a = r["attachment"]
-            if (a.get("origin") or {}).get("kind") in (None, "human") and a.get("prompt") and not is_sub:
+            if (a.get("origin") or {}).get("kind") in (None, "human") and a.get("prompt") and not is_sub \
+                    and not str(a.get("prompt")).lstrip().startswith("<"):  # queued notifications are not typed
                 human.append(("queued", str(a.get("prompt"))))
         if t != "user":
             continue
         content = (r.get("message") or {}).get("content")
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else (content or [])
+        okr = (r.get("origin") or {}).get("kind")
+        if (not is_sub and not r.get("isSidechain") and not r.get("isMeta") and okr in (None, "human")
+                and r.get("promptSource") not in ("sdk", "system")
+                and any(isinstance(b, dict) and b.get("type") == "image" for b in blocks)
+                and not any(isinstance(b, dict) and b.get("type") in ("text", "tool_result") for b in blocks)):
+            human.append(("image", "[image]"))
+        n0 = len(human)  # consecutive human text blocks of one record form one message (as in the index)
         for b in blocks:
             if b.get("type") == "tool_result":
                 c["tool_result"] += 1
@@ -96,7 +106,7 @@ def raw_claude(path, is_sub):
             ok = (r.get("origin") or {}).get("kind")
             if ok and ok != "human":
                 continue
-            if not ok and (r.get("promptSource") == "sdk" or (r.get("entrypoint") or "").startswith("sdk")):
+            if not ok and (r.get("promptSource") in ("sdk", "system") or (r.get("entrypoint") or "").startswith("sdk")):
                 continue
             if s.startswith("<command-name>") or s.startswith("<command-message>"):
                 human.append(("cmd", s))
@@ -104,6 +114,8 @@ def raw_claude(path, is_sub):
                 human.append(("bash", s))
             elif s.startswith("<") or s.startswith("Caveat:") or s.startswith("This session is being continued"):
                 continue
+            elif len(human) > n0 and human[-1][0] == "text":
+                human[-1] = ("text", human[-1][1] + "\n" + s)
             else:
                 human.append(("text", s))
     return c, human, titles, first, last
@@ -142,20 +154,19 @@ def raw_codex(path):
             et = pl.get("type")
             if et == "turn_aborted" and pl.get("reason") == "interrupted":
                 c["interrupted"] += 1
-            if et == "user_message":
-                ev_user.append(pl.get("message") or "")
+            if et == "user_message" and (pl.get("message") or "").strip():
+                ev_user.append(("event", pl.get("message") or ""))
             if et == "item_completed" and (pl.get("item") or {}).get("type") == "UserMessage":
                 it = pl["item"]
                 txt = "\n".join(x.get("text", "") for x in it.get("content") or [] if isinstance(x, dict))
-                ev_user.append(txt)
-    uniq = []
-    seen = set()
-    for u in ev_user:
-        k = " ".join(u.split())[:200]
-        if k not in seen:
-            seen.add(k)
-            uniq.append(u)
-    return c, uniq, meta or {}, first, last
+                if txt.strip():
+                    ev_user.append(("item", txt))
+    # multiset of typed prompts: per text, max(count in event form, count in item form)
+    per = collections.defaultdict(collections.Counter)
+    for src, u in ev_user:
+        per[" ".join(IMG.sub(" ", u).split())[:200]][src] += 1
+    typed = collections.Counter({k: max(v.values()) for k, v in per.items()})
+    return c, typed, meta or {}, first, last
 
 
 def main():
@@ -207,22 +218,45 @@ def main():
                 mism.append("titles")
             line["titles_raw/db"] = f"{len(rawt)}/{len(dbt)}"
         else:
-            c, ev_user, meta, first, last = raw_codex(path)
-            line.update({"raw_user_events": len(ev_user), "db_human": hm, "raw_tool_call": c["tool_call"], "db_tool_calls": tc,
+            c, typed, meta, first, last = raw_codex(path)
+            dbuser = collections.defaultdict(collections.Counter)  # normalized text -> kind counts (incl. inherited)
+            for k, t in con.execute("SELECT kind, text FROM messages WHERE sid=? AND role='user'", (sid,)):
+                dbuser[" ".join(IMG.sub(" ", t or "").split())[:200]][k] += 1
+            n_typed = sum(typed.values())
+            found = sum(min(n, sum(dbuser.get(k, {}).values())) for k, n in typed.items())
+            typed_kinds = collections.Counter()
+            for k, n in typed.items():
+                for kk, m in dbuser.get(k, {}).items():
+                    typed_kinds[kk] += min(n, m)
+            dbh = collections.Counter()
+            for k, kc in dbuser.items():
+                for kk, m in kc.items():
+                    if kk in HUMAN:
+                        dbh[k] += m
+            h_in_typed = sum(min(m, typed.get(k, 0)) for k, m in dbh.items())
+            inh = dict(con.execute("SELECT kind, COUNT(*) FROM messages WHERE sid=? AND inherited=1 GROUP BY kind",
+                                   (sid,)))
+            line.update({"raw_typed": n_typed, "typed_found_in_db": found,
+                         "typed_as_kinds": dict(typed_kinds.most_common(4)),
+                         "db_human_all": sum(dbh.values()), "db_human_in_typed": h_in_typed, "db_human_counted": hm,
+                         "raw_tool_call": c["tool_call"], "db_tool_calls": tc, "db_inherited_tool_calls": inh.get("tool_call", 0),
                          "raw_interrupted": c["interrupted"], "db_interrupts": intr, "raw_compacted": c["compacted"],
                          "db_compactions": comp, "raw_ri_asst": c["ri_assistant"], "db_asst": kinds.get("assistant", 0)})
-            src = meta.get("source")
-            if oc == "interactive" and len(ev_user) and abs(len(ev_user) - hm) > 0:
-                mism.append("human_vs_user_events")
-            if c["tool_call"] != tc:
+            if found != n_typed:
+                mism.append("typed_missing")
+            if oc == "interactive" and n_typed and sum(typed_kinds.get(k, 0) for k in HUMAN) < n_typed:
+                mism.append("typed_not_human")
+            if n_typed and h_in_typed < sum(dbh.values()):
+                mism.append("human_not_typed")
+            if c["tool_call"] != tc + inh.get("tool_call", 0):
                 mism.append("tool_calls")
             if c["interrupted"] != intr:
                 mism.append("interrupts")
             if c["compacted"] > comp:
                 mism.append("compaction")
-            if kinds.get("assistant", 0) < c["ri_assistant"]:
+            if kinds.get("assistant", 0) + inh.get("assistant", 0) < c["ri_assistant"]:
                 mism.append("assistant")
-            line["src"] = json.dumps(src)[:40]
+            line["src"] = json.dumps(meta.get("source"))[:40]
         if (first or "")[:19] != (st or "")[:19] or (last or "")[:19] != (en or "")[:19]:
             mism.append("timestamps")
             line["ts_raw"] = f"{(first or '')[:19]}..{(last or '')[:19]}"

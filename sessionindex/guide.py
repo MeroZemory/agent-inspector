@@ -18,15 +18,20 @@ EVENT_DOCS = {
     "model_switch": "Model changed within the session (Claude assistant message.model change; Codex turn_context.model change or model_reroute).",
     "model_fallback": "Claude model_refusal_fallback (refusal led to a fallback model).",
     "subagent_spawn": "Agent spawned a subagent (Claude Task/Agent tool_use; Codex spawn_agent call). detail: type: description.",
-    "fork": "Codex session_meta.forked_from_id present (this thread is a fork).",
-    "resume": "Codex session_meta for the same thread repeated later in the file.",
+    "fork": "Codex session_meta.forked_from_id present (this thread is a fork; most Codex subagents fork their parent); Claude fork-context-ref record (subagent got parent context).",
+    "resume": "Session resumed: Codex session_meta of the same thread repeated later in the file; Claude SessionStart:resume hook record (only present when a SessionStart hook is configured).",
+    "session_start": "Claude SessionStart:startup hook record (process start; only with a SessionStart hook configured).",
+    "context_clear": "Claude SessionStart:clear hook record (/clear).",
+    "relocated": "Claude relocated record: the session's cwd was moved. detail=new cwd.",
+    "max_turns": "Claude max_turns_reached attachment. detail=turnCount/maxTurns.",
+    "token_pressure": "(source derived) first message of a turn whose context reached >=90% of the reported window (Codex token_count.model_context_window). value=fraction. Claude transcripts do not record the window: use compaction (detail auto) and sessions.max_ctx_tokens.",
     "continued_in": "Claude continued-in record (session continued in another session id).",
     "rollback": "Codex thread_rolled_back (user undid N turns). value=num_turns.",
     "approval_request": "Codex asked for approval (exec/apply_patch/request_permissions).",
     "user_input_request": "Codex requested user input / elicitation.",
     "guardian_assessment": "Codex guardian (auto-approval reviewer) assessment.",
     "permission_mode": "Claude permission mode set/changed (default, plan, acceptEdits, bypassPermissions, auto).",
-    "hook_error": "Claude stop-hook summary with hook errors.",
+    "hook_error": "Claude hook failed: stop-hook summary hookErrors, or hook_non_blocking_error (exit code + stderr head).",
     "hook_blocked": "Claude hook prevented continuation.",
     "hook_blocking_error": "Claude hook returned a blocking error (attachment).",
     "hook_timeout": "Claude hook cancelled after timing out. value=durationMs.",
@@ -41,6 +46,7 @@ EVENT_DOCS = {
 }
 
 ALIAS_ORIGINS = {
+    "(all)": "aliases.current=1 marks the latest-timestamped name per (session, origin): e.g. the last session_index.jsonl line across all CODEX_HOMEs; older names stay with current=0",
     "claude_custom_title": "manual (/rename or custom title) - wins",
     "codex_state_name": "manual (Codex thread rename, state_5.sqlite threads.name) - wins",
     "codex_thread_name_event": "Codex thread_name_updated event (manual/auto unknown)",
@@ -64,6 +70,7 @@ SCHEMA_DOCS = {
         ("parent_sid", "parent session for subagents (may not exist in index)"),
         ("account/root_id", "source root label of the canonical file (e.g. codex-home, orca-acct-xxxx)"),
         ("cwd/project/project_root/project_method", "project is DERIVED from cwd (git root, git-worktree->main repo, pattern, cwd)"),
+        ("cwd_key", "lower-cased normalized cwd (forward slashes): join key for external per-cwd/worktree metadata"),
         ("started_at/last_activity_at", "UTC ISO; min/max record timestamps"),
         ("duration_s/active_s", "wall span / sum of inter-message gaps <= 30 min (derived)"),
         ("human_msgs/human_chars", "kinds human+human_command+human_shell, excluding imported/inherited/sidechain"),
@@ -88,19 +95,20 @@ SCHEMA_DOCS = {
         ("imported/inherited/sidechain", "1 = copied from another provider / copied from fork parent / inline sidechain"),
         ("ctx_tokens", "context tokens at this assistant message (see sessions.max_ctx_tokens)"),
     ],
-    "events": [("sid,seq,ts,type,detail,value", "problem/process signals; seq = nearest message; source=transcript or home:<root>")],
-    "aliases": [("sid,alias,origin,manual,ts,source", "all names; manual=1 user-set, 0 auto, NULL unknown")],
+    "events": [("sid,seq,ts,type,detail,value,file_id,offset", "problem/process signals; seq = nearest message; source=transcript | home:<root> (provider DBs) | derived (computed at ingest)")],
+    "aliases": [("sid,alias,origin,manual,ts,source,current", "all names; manual=1 user-set, 0 auto, NULL unknown; current=1 latest per origin")],
     "links": [("src_sid,rel,dst_sid,dst_provider,dst_pid,provenance", "rel: subagent_of | forked_from | parent_thread | continued_in | imported_from")],
     "facts": [("sid,key,value,origin", "provider metadata (pr_url, cost_usd, state.*, goal, ...)")],
-    "files": [("path,root_id,pkey,sid,role,relation,size,mtime_ns,dev,ino,parsed_offset,n_lines,n_bad,partial_tail",
-               "every physical file; role canonical|hardlink|copy|missing; relation for copies same_extent|older_extent")],
+    "files": [("path,root_id,pkey,sid,role,relation,size,mtime_ns,dev,ino,last_ts,probe_lines,parsed_offset,n_lines,n_bad,partial_tail",
+               "every physical file; role canonical|hardlink|copy|missing; relation for copies same_extent|older_extent|newer_extent")],
     "prompt_history": [("sid,provider,pid,ts,text,project", "typed-prompt logs (~/.claude/history.jsonl, CODEX_HOME/history.jsonl): ground truth for human typing")],
     "ann.annotations": [("id,sid,seq,tag,note,author,created_at", "agent-written notes (separate DB, never touched by ingest)")],
-    "messages_fts": [("text", "FTS5 trigram index over view fts_src: full text for prompts/assistant/reasoning; tool_call first 1024 chars; tool_output first 512 + last 1024 chars; developer/context_injection/system_reminder/meta/command_expansion not indexed (use --like or sql LIKE)")],
+    "messages_fts": [("text", "FTS5 trigram index over view fts_src: full text for prompts/assistant/reasoning; tool_call first 512 chars; tool_output: stored text if is_error=1, else first 256 + last 512 chars; developer/context_injection/system_reminder/meta/command_expansion/hook_output not indexed (use --like or sql LIKE)")],
 }
 
 EXAMPLES = """\
 sx stats --by month                              # corpus shape
+sx ingest --project Agentryx --since 2026-09-20   # index only what you need (also --sid/--file/--source/--until)
 sx sessions --provider codex --min-human 5 --sort human_chars --limit 10
 sx sessions --project Agentryx --since 2026-09-01 --has-event interrupt
 sx show <sid>                                    # metadata + one line per human turn
@@ -111,6 +119,8 @@ sx search '"다시 해"' --human --limit 20         # Korean phrase in human mes
 sx search 'rate limit' --kinds tool_output,api_error
 sx sql "SELECT type, COUNT(*) n FROM events GROUP BY type ORDER BY n DESC"
 sx sql "SELECT s.project, AVG(s.interrupts) FROM sessions s WHERE s.origin_class='interactive' GROUP BY 1"
+sx sessions --has-event rate_limit,token_pressure --sort last   # problem-signal filter
+sx sql "WITH t AS (SELECT sid, seq, kind, text, LAG(kind) OVER (PARTITION BY sid ORDER BY seq) pk FROM messages WHERE kind IN ('human','interrupt_marker')) SELECT sid, seq, substr(text,1,120) t FROM t WHERE kind='human' AND pk='interrupt_marker' LIMIT 20"   # what people typed right after interrupting
 sx note <sid> --seq 12 --tag correction --note "user re-asks same fix"   # write
 sx notes --tag correction                                                # read
 """
@@ -128,7 +138,10 @@ CAVEATS = """\
 - Trigram FTS needs >= 3 characters per term; shorter queries fall back to LIKE (slow). Quote phrases: '"..."'.
 - Counts exclude messages marked imported/inherited (fork prefix copies, Codex->Claude imports).
 - events from source home:* (Codex state DBs) duplicate some transcript signals and are excluded from session counters.
-- Orca metadata adapter is not implemented yet (Orca-run sessions are indexed via their Codex/Claude homes).
+- Canonical copy = latest last-record timestamp, then more lines, then lowest root rank (codex-home=0).
+- Tool call arguments are stored up to 256 KB; `sx raw` has the rest.
+- Orca metadata adapter is not implemented yet (Orca-run sessions are indexed via their Codex/Claude homes);
+  external per-session metadata can join on sessions.pid (Claude sessionId / Codex thread id) or sessions.cwd_key.
 """
 
 
@@ -140,6 +153,9 @@ def build(sections, live: dict) -> str:
                    f"messages={live.get('messages')} events={live.get('events')}")
         out.append("Output is JSON Lines by default (--format table for humans). IDs: sid prefix or provider id prefix.")
         out.append("Commands: guide stats sessions show read raw search sql note notes ingest  (sx <cmd> -h for flags)")
+        out.append("Start: `sx stats --by provider` -> `sx sessions [filters]` -> `sx show <sid>` (one line per human turn) "
+                   "-> `sx read <sid> --turn a-b` -> `sx raw <sid> --seq N` for the untruncated source record. "
+                   "Record findings with `sx note`.")
     if "schema" in sections:
         out.append("\n## schema (tables: columns - meaning)")
         for t, cols in SCHEMA_DOCS.items():
