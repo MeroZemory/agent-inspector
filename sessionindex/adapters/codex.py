@@ -640,7 +640,7 @@ def home_metadata(root) -> dict:
                     "SELECT thread_id, turn_id, status, error_json, started_at FROM thread_turns "
                     "WHERE status IN ('failed','interrupted')"):
                 res["events"].append(["codex", tid, norm_ts(started) if started else None,
-                                      f"state_turn_{status}", (err or "")[:300], None])
+                                      f"state_turn_{status}", f"[turn {turn}] {(err or '')[:300]}", None])
             con.close()
         except sqlite3.Error as e:
             res["errors"].append(f"thread_history_1: {e}")

@@ -41,8 +41,8 @@ EVENT_DOCS = {
     "turn_duration": "Duration of a model turn in ms (Claude system turn_duration; Codex task_complete.duration_ms). value=ms.",
     "warning": "Codex warning event.",
     "agents_killed": "Claude background agents killed.",
-    "state_turn_failed": "(source home:*) Codex state DB thread_turns status=failed; detail=error_json. Not counted in sessions.errors.",
-    "state_turn_interrupted": "(source home:*) Codex state DB thread_turns status=interrupted. Overlaps transcript 'interrupt'; not counted in sessions.interrupts.",
+    "state_turn_failed": "(source home:*) Codex state DB thread_turns status=failed; detail='[turn <turn_id>] <error_json>' (turn id keeps distinct turns distinct across home copies). Not counted in sessions.errors.",
+    "state_turn_interrupted": "(source home:*) Codex state DB thread_turns status=interrupted; detail='[turn <turn_id>]'. Overlaps transcript 'interrupt'; not counted in sessions.interrupts.",
 }
 
 ALIAS_ORIGINS = {
