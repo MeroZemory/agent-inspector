@@ -84,6 +84,8 @@ CREATE INDEX IF NOT EXISTS facts_sid ON facts(sid);
 CREATE TABLE IF NOT EXISTS prompt_history(
   sid TEXT, provider TEXT, pid TEXT, ts TEXT, text TEXT, project TEXT, source TEXT);
 CREATE INDEX IF NOT EXISTS prompt_history_sid ON prompt_history(sid);
+CREATE INDEX IF NOT EXISTS prompt_history_pid_ts ON prompt_history(pid, ts);
+CREATE INDEX IF NOT EXISTS events_sid_ts ON events(sid, ts);
 -- (source, sid) composites: fast per-root deletes AND per-session deletes (a bare source index would be
 -- picked for `sid=? AND source='transcript'` and scan every transcript row)
 DROP INDEX IF EXISTS events_source;

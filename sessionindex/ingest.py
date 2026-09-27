@@ -896,10 +896,15 @@ def _write_home(con, root, hm, stats_run):
                      for l in hm.get("links", []) if l[1] and l[4]])
     _exec_rows(con, "INSERT OR IGNORE INTO facts(sid,key,value,origin,ts,source) VALUES(?,?,?,?,?,?)",
                     [(short_sid(f[0], f[1]), f[2], f[3], f[4], f[5], src) for f in hm.get("facts", []) if f[1]])
+    # Several homes (e.g. ~/.codex plus Orca runtime/account homes) hold copies of the same state DB and
+    # history.jsonl; keep one row per logical event/prompt instead of one per home.
     _exec_rows(con, "INSERT INTO events(sid,seq,ts,type,detail,value,file_id,offset,source) "
-                    "VALUES(?,NULL,?,?,?,?,NULL,NULL,?)",
+                    "SELECT ?1,NULL,?2,?3,?4,?5,NULL,NULL,?6 WHERE NOT EXISTS (SELECT 1 FROM events "
+                    "WHERE sid=?1 AND ts IS ?2 AND type=?3 AND detail IS ?4 AND source LIKE 'home:%')",
                     [(short_sid(e[0], e[1]), e[2], e[3], e[4], e[5], src) for e in hm.get("events", []) if e[1]])
-    _exec_rows(con, "INSERT INTO prompt_history(sid,provider,pid,ts,text,project,source) VALUES(?,?,?,?,?,?,?)",
+    _exec_rows(con, "INSERT INTO prompt_history(sid,provider,pid,ts,text,project,source) "
+                    "SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS (SELECT 1 FROM prompt_history "
+                    "WHERE provider=?2 AND pid IS ?3 AND ts IS ?4 AND text IS ?5)",
                     [(short_sid(p[0], p[1]) if p[1] else None, p[0], p[1], p[2], p[3], p[4], src)
                      for p in hm.get("prompt_history", [])])
     for e in hm.get("errors", []):
