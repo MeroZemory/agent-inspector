@@ -129,6 +129,7 @@ sx read <sid> --turn 3-5 --full                  # everything in turns 3..5, unt
 sx raw <sid> --seq 12                            # original JSON line from the source file
 sx search '"다시 해"' --human --limit 20         # Korean phrase in human messages (>=3 chars)
 sx search 'rate limit' --kinds tool_output,api_error
+sx search 'ㅋㅋ|헐|이게 뭐' --regex --human --project maplestory   # regex (case-insensitive) over full text, human only
 sx sessions --provider agy --project maplestory --subagents include   # Antigravity CLI (agy) incl. Teamwork subagents
 sx sql "SELECT type, COUNT(*) n FROM events GROUP BY type ORDER BY n DESC"
 sx sql "SELECT s.project, AVG(s.interrupts) FROM sessions s WHERE s.origin_class='interactive' GROUP BY 1"
@@ -149,6 +150,7 @@ CAVEATS = """\
 - Tool outputs are capped (default 4 KB), tool args 16 KB, injected text 4 KB; text_len keeps the original length;
   `sx raw` returns the full source record.
 - Trigram FTS needs >= 3 characters per term; shorter queries fall back to LIKE (slow). Quote phrases: '"..."'.
+  `--regex` (or `text REGEXP 'pat'` in sx sql) scans full stored text with a Python regex.
 - agy (Antigravity CLI): files are SQLite DBs; messages.offset = step index and `sx raw` prints the decoded step.
   A running agy conversation grows its -wal, not the .db: re-ingest it with `sx ingest --sid <sid> --reparse`.
   agy human-vs-scripted (`agy -p`) is inferred from history.jsonl + Temp workspaces (README).

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 
 SCHEMA_VERSION = "3"
@@ -162,11 +163,24 @@ def init_ann(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+_RE_CACHE: dict = {}
+
+
+def _regexp(pat, s):
+    if s is None or pat is None:
+        return 0
+    r = _RE_CACHE.get(pat)
+    if r is None:
+        r = _RE_CACHE[pat] = re.compile(pat, re.I | re.S)
+    return 1 if r.search(s) else 0
+
+
 def connect_ro(index_path: str, ann_path: str | None = None) -> sqlite3.Connection:
     """Read-only connection (mode=ro + query_only); annotations DB attached as `ann`."""
     uri = "file:" + index_path.replace("\\", "/") + "?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=30)
     con.execute("PRAGMA query_only=1")
+    con.create_function("regexp", 2, _regexp, deterministic=True)  # enables `text REGEXP 'pat'` (case-insensitive)
     if ann_path and os.path.exists(ann_path):
         con.execute("ATTACH DATABASE ? AS ann", ("file:" + ann_path.replace("\\", "/") + "?mode=ro",))
     return con

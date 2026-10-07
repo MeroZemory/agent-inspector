@@ -478,6 +478,22 @@ def cmd_search(a):
     short = any(len(t.strip('"*()')) < 3 for t in toks if t.upper() not in ("AND", "OR", "NOT"))
     use_like = a.like or short
     order = "m.ts DESC" if a.sort == "recent" else ("m.ts ASC" if a.sort == "oldest" else "rank")
+    if a.regex:
+        try:
+            rx = re.compile(a.query, re.I | re.S)
+        except re.error as e:
+            die(f"bad regex: {e}")
+        q = (f"SELECT m.sid, m.seq, m.ts, m.kind, s.project, m.text, m.text_len FROM messages m JOIN sessions s "
+             f"ON s.sid=m.sid WHERE m.text REGEXP ? AND {w}{kw} ORDER BY {order if order != 'rank' else 'm.ts DESC'} "
+             f"LIMIT ? OFFSET ?")
+        for r in con.execute(q, [a.query] + args + kargs + [a.limit, a.offset]):
+            t = r[5] or ""
+            mt = rx.search(t)
+            i, j = (mt.start(), mt.end()) if mt else (0, 0)
+            o.emit({"sid": r[0], "seq": r[1], "ts": (r[2] or "")[:16], "kind": r[3], "project": r[4], "len": r[6],
+                    "snippet": t[max(0, i - a.context): j + a.context].replace("\n", " ")})
+        o.flush(100)
+        return
     if use_like:
         if short and not a.like:
             sys.stderr.write("[sx] term shorter than 3 chars: trigram FTS cannot match; using LIKE scan (slower)\n")
@@ -673,6 +689,8 @@ def build_parser():
     s.add_argument("--kinds")
     s.add_argument("--phrase", action="store_true", help="treat the query as one literal phrase")
     s.add_argument("--like", action="store_true", help="force substring LIKE scan")
+    s.add_argument("--regex", action="store_true",
+                   help="query is a Python regex (case-insensitive) over full stored text; scans like --like")
     s.add_argument("--sort", choices=["rank", "recent", "oldest"], default="rank")
     s.add_argument("--with-copied", action="store_true")
     s.add_argument("--limit", type=int, default=20)

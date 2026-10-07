@@ -239,8 +239,8 @@ token-lean (compact fields, clipped text with explicit lengths, small limits); o
 | `show <id>` | metadata, aliases, links, children, event counts + one line per prompt turn |
 | `read <id> [--seq a-b] [--turn a-b] [--kinds ...] [--no-tools] [--full]` | messages |
 | `raw <id> --seq N` / `--event EID` | original JSON line from the source file (agy: the step decoded to JSON) |
-| `search "<fts>" [filters] [--human] [--kinds] [--phrase] [--like]` | trigram FTS with snippets |
-| `sql "<SELECT ...>"` | read-only SQL (mode=ro + query_only; one statement; SELECT/WITH/EXPLAIN/VALUES only) |
+| `search "<fts>" [filters] [--human] [--kinds] [--phrase] [--like] [--regex]` | trigram FTS with snippets; `--regex`: case-insensitive Python regex over the full stored text (scan) |
+| `sql "<SELECT ...>"` | read-only SQL (mode=ro + query_only; one statement; SELECT/WITH/EXPLAIN/VALUES only); `text REGEXP 'pat'` available |
 | `note <id> [--seq N] --tag T --note "..."` / `notes [id] [--tag]` | annotations |
 | `ingest [--source X] [--rebuild] [--max-jobs N]` | build/update the index |
 
