@@ -65,8 +65,8 @@ ALIAS_ORIGINS = {
 
 SCHEMA_DOCS = {
     "sessions": [
-        ("sid", "short stable id (c=claude, x=codex, o=opencode) = hash(provider:pid); prefix match allowed"),
-        ("provider/pid", "provider and provider session id (Claude sessionId or '<parent>:agent-<id>' for subagents; Codex thread id)"),
+        ("sid", "short stable id (c=claude, x=codex, o=opencode, g=agy) = hash(provider:pid); prefix match allowed"),
+        ("provider/pid", "provider and provider session id (Claude sessionId or '<parent>:agent-<id>' for subagents; Codex thread id; agy conversation uuid)"),
         ("kind", "main | subagent | workflow_agent (Claude workflow subagent)"),
         ("origin_class", "interactive | noninteractive (claude sdk-*/codex exec,mcp) | subagent | imported | unknown"),
         ("client/source", "Claude entrypoint (cli, claude-desktop, sdk-cli...) / Codex originator + SessionSource"),
@@ -107,7 +107,7 @@ SCHEMA_DOCS = {
     "facts": [("sid,key,value,origin", "provider metadata (pr_url, cost_usd, state.*, goal, ...)")],
     "files": [("path,root_id,pkey,sid,role,relation,size,mtime_ns,dev,ino,last_ts,probe_lines,parsed_offset,n_lines,n_bad,partial_tail",
                "every physical file; role canonical|hardlink|copy|missing; relation for copies same_extent|older_extent|newer_extent")],
-    "prompt_history": [("sid,provider,pid,ts,text,project", "typed-prompt logs (~/.claude/history.jsonl, CODEX_HOME/history.jsonl): ground truth for human typing")],
+    "prompt_history": [("sid,provider,pid,ts,text,project", "typed-prompt logs (~/.claude/history.jsonl, CODEX_HOME/history.jsonl, ~/.gemini/antigravity-cli/history.jsonl): ground truth for human typing")],
     "orca": [("sid,kind,key,name,detail,ts,method",
               "Orca links: kind tab|pane|worktree|pty|orch_dispatch_contexts|orch_worker_dispatches|orch_worker_terminal_resources; "
               "method sessionId (direct) or cwd_time (same cwd + time overlap; may be ambiguous)")],
@@ -129,6 +129,7 @@ sx read <sid> --turn 3-5 --full                  # everything in turns 3..5, unt
 sx raw <sid> --seq 12                            # original JSON line from the source file
 sx search '"다시 해"' --human --limit 20         # Korean phrase in human messages (>=3 chars)
 sx search 'rate limit' --kinds tool_output,api_error
+sx sessions --provider agy --project maplestory --subagents include   # Antigravity CLI (agy) incl. Teamwork subagents
 sx sql "SELECT type, COUNT(*) n FROM events GROUP BY type ORDER BY n DESC"
 sx sql "SELECT s.project, AVG(s.interrupts) FROM sessions s WHERE s.origin_class='interactive' GROUP BY 1"
 sx sessions --has-event rate_limit,token_pressure --sort last   # problem-signal filter
@@ -148,6 +149,9 @@ CAVEATS = """\
 - Tool outputs are capped (default 4 KB), tool args 16 KB, injected text 4 KB; text_len keeps the original length;
   `sx raw` returns the full source record.
 - Trigram FTS needs >= 3 characters per term; shorter queries fall back to LIKE (slow). Quote phrases: '"..."'.
+- agy (Antigravity CLI): files are SQLite DBs; messages.offset = step index and `sx raw` prints the decoded step.
+  A running agy conversation grows its -wal, not the .db: re-ingest it with `sx ingest --sid <sid> --reparse`.
+  agy human-vs-scripted (`agy -p`) is inferred from history.jsonl + Temp workspaces (README).
 - Counts exclude messages marked imported/inherited (fork prefix copies, Codex->Claude imports).
 - events from source home:* (Codex state DBs) duplicate some transcript signals and are excluded from session counters.
 - Canonical copy = latest last-record timestamp, then more lines, then lowest root rank (codex-home=0).

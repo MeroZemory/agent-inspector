@@ -1,6 +1,6 @@
 """Cross-check human-vs-injected classification against typed-prompt logs (prompt_history).
 
-prompt_history comes from ~/.claude/history.jsonl and CODEX_HOME/history.jsonl: what the CLI/TUI
+prompt_history comes from ~/.claude/history.jsonl, CODEX_HOME/history.jsonl and the agy home history.jsonl: what the CLI/TUI
 recorded as typed input. Desktop-app prompts and queued prompts may be missing there, so
 'precision' below is a lower bound.
 
@@ -40,7 +40,7 @@ def main():
         if len(k) >= 4:
             hist[sid].append((prov, k, text))
     res = {}
-    for prov in ("claude", "codex"):
+    for prov in ("claude", "codex", "agy"):
         sids = [s for s, v in hist.items() if v and v[0][0] == prov]
         tot = matched = 0
         wrong = collections.Counter()

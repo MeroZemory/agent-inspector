@@ -432,9 +432,13 @@ def cmd_raw(a):
                         "WHERE m.sid=? AND m.seq=?", (sid, a.seq)).fetchone()
     if not r:
         die("record not found")
-    with open(r[2], "rb") as fh:  # read-only
-        fh.seek(r[1])
-        line = fh.readline()
+    if r[2].endswith(".db"):  # agy: SQLite conversation, offset = step index
+        from .adapters import agy
+        line = agy.raw_record(r[2], r[1]).encode("utf-8")
+    else:
+        with open(r[2], "rb") as fh:  # read-only
+            fh.seek(r[1])
+            line = fh.readline()
     txt = line.decode("utf-8", "replace").rstrip("\n")
     info = {"path": r[2], "offset": r[1], "bytes": len(line)}
     if not a.full and len(txt) > a.max_chars:

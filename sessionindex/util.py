@@ -9,7 +9,7 @@ import os
 import re
 
 B32 = "abcdefghijklmnopqrstuvwxyz234567"
-PROVIDER_PREFIX = {"claude": "c", "codex": "x", "opencode": "o", "orca": "r"}
+PROVIDER_PREFIX = {"claude": "c", "codex": "x", "opencode": "o", "orca": "r", "agy": "g"}
 
 
 def short_sid(provider: str, pid: str) -> str:

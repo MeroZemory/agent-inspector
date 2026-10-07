@@ -17,6 +17,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sessionindex.adapters import ADAPTERS  # noqa: E402
+from sessionindex.adapters.agy import _user_kind as agy_kind  # noqa: E402
 from sessionindex.classify import claude_user_text_kind, codex_user_text_kind  # noqa: E402
 from sessionindex.config import expand_roots, load_config  # noqa: E402
 
@@ -39,6 +40,8 @@ def rowkey(m):
 
 
 def resume_check(ad, root, c, tmp):
+    if c.path.endswith(".db"):  # agy SQLite conversation: always fully re-parsed, no byte-offset resume
+        return "resume=n/a(sqlite)"
     size = os.path.getsize(c.path)
     dst = os.path.join(tmp, os.path.basename(c.path))
     shutil.copyfile(c.path, dst)
@@ -105,6 +108,11 @@ def synthetic():
         (codex_user_text_kind("다시 해줘", is_sub=False, noninteractive=False), "human"),
         (codex_user_text_kind("task text", is_sub=True, noninteractive=False), "agent_prompt"),
         (codex_user_text_kind("task text", is_sub=False, noninteractive=True), "sdk_prompt"),
+        (agy_kind("어쩌라고 개발 완료했다고?", False, False), "human"),
+        (agy_kind("/goal GOAL.md 를 읽고", False, False), "human_command"),
+        (agy_kind("You are challenger_1", True, False), "agent_prompt"),
+        (agy_kind("resume", True, False, ["resume"]), "human"),
+        (agy_kind("prompt.md 파일의 지시를 그대로 수행하라.", False, True), "sdk_prompt"),
     ]
     bad = [(got, want) for got, want in cases if got != want]
     return f"synthetic classification: {len(cases) - len(bad)}/{len(cases)} ok" + (f" FAIL {bad}" if bad else "")
@@ -142,7 +150,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="sx-selftest-")
     fails = 0
     try:
-        for adapter in ("claude", "codex", "cc_transcripts"):
+        for adapter in ("claude", "codex", "cc_transcripts", "agy"):
             ad = ADAPTERS[adapter]
             cands = [(r, c) for r in roots if r.adapter == adapter and not r.is_test for c in ad.discover(r)]
             by_sub = collections.defaultdict(list)

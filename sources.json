@@ -1,5 +1,5 @@
 {
-  "_comment": "Source roots. Each entry: adapter (claude|codex|cc_transcripts), path or glob, label (use {name}/{parent} placeholders for globs), rank (lower wins canonical ties), is_test. Add new roots here; no schema change needed. Never point a root at credential directories.",
+  "_comment": "Source roots. Each entry: adapter (claude|codex|cc_transcripts|agy), path or glob, label (use {name}/{parent} placeholders for globs), rank (lower wins canonical ties), is_test. Add new roots here; no schema change needed. Never point a root at credential directories.",
   "caps": {
     "tool_output_chars": 4096,
     "tool_args_chars": 262144,
@@ -16,7 +16,10 @@
     {"adapter": "codex", "path": "~/.ultra-codex", "label": "ultra-codex", "rank": 3},
     {"adapter": "codex", "glob": "~/.aisw/profiles/codex/*", "label": "aisw-codex-{name}", "rank": 4},
     {"adapter": "codex", "glob": "~/.agentryx/agents/*/session", "label": "agentryx-agent-{parent8}", "rank": 8, "is_test": true},
-    {"adapter": "codex", "glob": "~/research/codex-session-status/probe-*/home", "label": "{parent}", "rank": 9, "is_test": true}
+    {"adapter": "codex", "glob": "~/research/codex-session-status/probe-*/home", "label": "{parent}", "rank": 9, "is_test": true},
+
+    {"adapter": "agy", "path": "~/.gemini/antigravity-cli", "label": "agy-home", "rank": 0},
+    {"adapter": "agy", "path": "~/.gemini/antigravity-cli/archived_image_sessions", "label": "agy-archived-images", "rank": 1}
   ],
-  "skip_path_substrings": ["recovery-backups"]
+  "skip_path_substrings": ["recovery-backups", "oauth_creds", "oauth-token", "google_accounts", "credentials.json"]
 }

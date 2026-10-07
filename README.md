@@ -1,7 +1,8 @@
 # session-index (`sx`)
 
 Local, agent-queryable catalog of every AI coding-agent session transcript on this PC
-(Claude Code, Codex CLI/Desktop, Orca-run Codex homes, and Claude-compatible `ses_*` transcripts).
+(Claude Code, Codex CLI/Desktop, Orca-run Codex homes, Antigravity CLI `agy`, and Claude-compatible `ses_*`
+transcripts).
 It is a **catalog + query surface**, not an analysis: agents (Claude subagents, Codex CLI agents with
 only a shell) orient with one command and decide what to read.
 
@@ -25,6 +26,7 @@ sessionindex/
   adapters/claude.py         Claude Code transcripts + ~/.claude/history.jsonl + codex-import-history.json
   adapters/codex.py          Codex rollouts + CODEX_HOME metadata (session_index, state_5, thread_history_1, goals_1, history, imports)
   adapters/cc_transcripts.py ~/.claude/transcripts/ses_*.jsonl (OpenCode-style ids; writer not recorded)
+  adapters/agy.py            Antigravity CLI conversations (SQLite + protobuf steps) + agy summaries/history.jsonl
   ingest.py                  discovery, dedupe, canonical selection, incremental plan, worker pool, finalize, FTS
   projects.py                derived project from cwd (git root / git-worktree -> main repo / patterns)
   cli.py, guide.py           query CLI and the self-describing guide
@@ -134,6 +136,22 @@ Re-running the same selection is a no-op for unchanged files. Each run also refr
 `sid` = provider letter (`c` Claude, `x` Codex, `o` ses_* transcripts) + 9 base32 chars of
 `sha1(provider:pid)`: short, stable across rebuilds, prefix-matchable. Provider ids (≥6 chars) also resolve.
 
+**Antigravity CLI (`agy`, provider `agy`, sid prefix `g`)** keeps each conversation in
+`~/.gemini/antigravity-cli/conversations/<uuid>.db`: SQLite, one protobuf step per row (stdlib wire decoder; the
+field map is documented at the top of `adapters/agy.py`). Also read: `conversation_summaries.db` (title, agent
+name, parent conversation -> `subagent_of`), `history.jsonl` (typed prompts -> `prompt_history`) and the
+`archived_image_sessions/` copy (root `agy-archived-images`). Mapped: user inputs, assistant text, thinking
+(`reasoning`), tool calls/results (failed status -> `is_error` + `tool_error`), context summaries
+(`compaction_summary` + `compaction`), task notifications / agent messages, client notes (quota -> `rate_limit`,
+"stream was interrupted" -> `auto_continuation` + `stream_retry`, other API errors -> `api_error`), model per
+step (gen_metadata), cwd/workspace/branch, Teamwork subagents (agent name, parent). `messages.offset` is the step
+index and `sx raw` prints that step decoded to JSON. Never read: `oauth_creds.json`, `antigravity-oauth-token`,
+`google_accounts.json`, `installation_id` (also in `skip_path_substrings`). DBs open `immutable` (no side
+files); a DB whose `-wal` holds data (agy running) is copied with its WAL to a private temp dir first. Every
+change is a full re-parse; a live conversation may need `sx ingest --sid <sid> --reparse` because agy grows
+the `-wal`, not the `.db`. Conversations listed in `conversation_summaries.db` whose `.db` is gone get a fact
+`agy.missing_conversation_db` (their typed prompts survive only in `prompt_history`).
+
 ## Classification: human vs injected (`messages.kind`)
 
 The user role carries much more than what a person typed. Rules are ordered (first match wins); see
@@ -177,8 +195,17 @@ Developer-role messages -> `developer`. The same message recorded as `response_i
 than were already kept (so a genuinely repeated prompt is kept twice); reasoning summaries are paired part by
 part (events carry one part each). The `origin` column says which copy was kept.
 
-Session `origin_class`: `interactive` (Claude cli/desktop/vscode, Codex cli/vscode/Desktop), `noninteractive`
-(Claude `sdk-*` entrypoints, Codex exec/mcp), `subagent`, `imported` (only copied content), `unknown`.
+agy (user-input steps; no in-band injection markers exist, injected text arrives as other step types):
+text found in that conversation's `history.jsonl` entries -> `human` (`human_command` for a leading `/word`, e.g.
+`/goal`), also inside a Teamwork subagent conversation the person resumed and typed into; otherwise subagent
+conversation -> `agent_prompt`; main conversation with typed history -> `human`; main conversation in a
+Temp/.tmp workspace, or with no history entry although it started after `history.jsonl` began -> `sdk_prompt`
+(scripted `agy -p` runs; heuristic: a conversation launched with an initial prompt argument and never typed
+into also lands here); `/word` -> `human_command`; otherwise `human`.
+
+Session `origin_class`: `interactive` (Claude cli/desktop/vscode, Codex cli/vscode/Desktop, agy TUI),
+`noninteractive` (Claude `sdk-*` entrypoints, Codex exec/mcp, agy rule above), `subagent`, `imported` (only
+copied content), `unknown`.
 
 Known limits:
 * Prompts sent through non-interactive clients are `sdk_prompt`: they may be human-written or program-generated.
@@ -211,7 +238,7 @@ token-lean (compact fields, clipped text with explicit lengths, small limits); o
 | `sessions [filters] [--sort last|started|human_chars|human|length|active|msgs|errors|tool_errors|interrupts|compactions|ctx]` | list |
 | `show <id>` | metadata, aliases, links, children, event counts + one line per prompt turn |
 | `read <id> [--seq a-b] [--turn a-b] [--kinds ...] [--no-tools] [--full]` | messages |
-| `raw <id> --seq N` / `--event EID` | original JSON line from the source file |
+| `raw <id> --seq N` / `--event EID` | original JSON line from the source file (agy: the step decoded to JSON) |
 | `search "<fts>" [filters] [--human] [--kinds] [--phrase] [--like]` | trigram FTS with snippets |
 | `sql "<SELECT ...>"` | read-only SQL (mode=ro + query_only; one statement; SELECT/WITH/EXPLAIN/VALUES only) |
 | `note <id> [--seq N] --tag T --note "..."` / `notes [id] [--tag]` | annotations |

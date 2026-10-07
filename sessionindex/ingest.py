@@ -547,6 +547,8 @@ _HEAD_TS = re.compile(rb'"timestamp":"([^"]+)"')
 
 def _head(path: str) -> tuple[str | None, str | None]:
     """(cwd, first timestamp) from the first 64 KB of a transcript (read-only)."""
+    if path.endswith(".db"):  # agy SQLite conversation
+        return ADAPTERS["agy"].head(path)
     try:
         with open(path, "rb") as fh:
             b = fh.read(65536)
@@ -709,7 +711,7 @@ def _upsert_session(con, sid, res, job, gi):
         bad = res.get("n_bad", 0)
         outtok = m.get("out_tokens_add") or 0
     ctx = job["ctx"] or {}
-    merged["ctx"] = {k: v for k, v in ctx.items() if k != "meta_path"}
+    merged["ctx"] = {k: v for k, v in ctx.items() if k not in ("meta_path", "hist_keys")}
 
     vals, agent_name, parent_pid = _session_vals(prov, pkey, merged, ctx, job["subkind"], gi, job["file_id"])
     vals.update({"out_tokens": outtok or None, "rec_counts": jdump(rec), "parse_bad": bad,
@@ -751,6 +753,14 @@ def _session_vals(prov, pkey, merged, ctx, subkind, gi, file_id):
         agent_type = merged.get("agent_type")
         agent_name = merged.get("agent_name")
         parent_pid = merged.get("parent_thread") if is_sub else None
+        client = merged.get("client")
+        source = merged.get("source")
+        origin_class = "subagent" if is_sub else ("noninteractive" if merged.get("nonint") else "interactive")
+    elif prov == "agy":
+        is_sub = bool(merged.get("is_sub"))
+        kind = "subagent" if is_sub else "main"
+        agent_name = agent_type = merged.get("agent_name")
+        parent_pid = merged.get("parent") if is_sub else None
         client = merged.get("client")
         source = merged.get("source")
         origin_class = "subagent" if is_sub else ("noninteractive" if merged.get("nonint") else "interactive")
@@ -844,7 +854,7 @@ def _write_catalog(con, res, job, gi, prev):
         return
     ctx = job["ctx"] or {}
     merged = dict(m)
-    merged["ctx"] = {k: v for k, v in ctx.items() if k != "meta_path"}
+    merged["ctx"] = {k: v for k, v in ctx.items() if k not in ("meta_path", "hist_keys")}
     vals, agent_name, parent_pid = _session_vals(prov, pkey, merged, ctx, job["subkind"], gi, job["file_id"])
     st, en = m.get("first_ts"), m.get("last_ts")
     fp = res.get("first_prompt")
@@ -916,8 +926,8 @@ def _write_home(con, root, hm, stats_run):
 
 TITLE_PRIORITY = [
     ("claude_custom_title", 0), ("codex_state_name", 0), ("codex_thread_name_event", 1),
-    ("claude_ai_title", 2), ("codex_session_index", 2), ("codex_state_title", 3), ("claude_summary", 3),
-    ("claude_agent_name", 4), ("claude_subagent_description", 4), ("codex_agent_nickname", 5),
+    ("claude_ai_title", 2), ("codex_session_index", 2), ("agy_title", 2), ("codex_state_title", 3), ("claude_summary", 3),
+    ("claude_agent_name", 4), ("claude_subagent_description", 4), ("codex_agent_nickname", 5), ("agy_agent_name", 5),
     ("orca_tab_title", 5), ("orca_ai_vault_title", 5), ("orca_worktree_name", 7), ("first_human_prompt", 9),
 ]
 _TP = dict(TITLE_PRIORITY)
