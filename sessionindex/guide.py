@@ -45,6 +45,7 @@ EVENT_DOCS = {
     "tool_span": "(timing, Codex) one tool call: ts=call, value=seconds until its output; detail='<kind> <call_id>', kind build|shell|wait|subagent|web|edit|other (see `sx guide --section timing`).",
     "compaction_span": "(timing, Codex) ContextCompaction item: ts=started_at_ms, value=seconds.",
     "model_step": "(timing, Codex) model input (turn start / tool output) to the next tool call or assistant message, or to the turn end when no tool call of the turn is open. ts=input; value=seconds; detail='<tool_call|assistant|turn_end|turn_end_error> err=<error+stream_error events inside>'.",
+    "usage": "(usage, Codex + Claude) token usage of one model response; detail=compact JSON {m model, e effort, t service tier, i input incl. cached + cache writes, c cached input, w cache-write input, o output incl. reasoning, r reasoning part of o, n responses (1, or 0 for a later Claude record that only adds changed counts), id response id, tu Codex turn id, src 'token_count' fallback, side Claude sidechain}; value=i+o. Used by `sx usage`; excluded from sessions.events_n. Query with json_extract(detail,'$.o').",
     "agents_killed": "Claude background agents killed.",
     "state_turn_failed": "(source home:*) Codex state DB thread_turns status=failed; detail='[turn <turn_id>] <error_json>' (turn id keeps distinct turns distinct across home copies). Not counted in sessions.errors.",
     "state_turn_interrupted": "(source home:*) Codex state DB thread_turns status=interrupted; detail='[turn <turn_id>]'. Overlaps transcript 'interrupt'; not counted in sessions.interrupts.",
@@ -148,6 +149,35 @@ turns write no turn_duration and compaction has no duration, so turn boundaries 
 Sessions parsed before timing support are re-parsed by a plain `sx ingest --sid ...` (adapter PARSER_VERSION).
 """
 
+USAGE = """\
+`sx usage [filters] [--by session|project|model|effort|tier|day]` sums token usage per model response (event type
+`usage`) in the window. Tokens only: no money or quota conversion (plan quotas weight models, tiers and cached input
+differently and are not published per token).
+Columns: responses, input (ALL prompt tokens: fresh + cached reads + cache writes), cached (cache reads), cache_write
+(Claude cache_creation; Codex cache_write_input_tokens, 0 in every rollout seen), output (INCLUDES reasoning for both
+providers: Codex total_tokens = input + output and reasoning <= output; Claude thinking_tokens <= output_tokens),
+reasoning (the reasoning part of output: Codex reasoning_output_tokens, Claude output_tokens_details.thinking_tokens,
+0 where the transcript has no breakdown), in_turn_h (Codex turn intervals clipped to the window, as in `sx timing`),
+out_per_turn_h (output of sessions with turn timing / in_turn_h), share_pct (input+output share of the window total),
+out_share_pct (output share). The last row is the window total. --format table prints tokens in millions (*_M).
+Settings per response: Codex model/effort/tier = the latest turn_context or thread_settings_applied before the
+response (tier `default` or `priority` = Fast; null, shown as (unset), before the first thread_settings_applied: the first
+turn of a new session and older rollouts);
+Claude = the record's model, effort (per-turn effort) and usage.service_tier (`fast` when usage.speed is fast).
+Tier/effort/model rows are per provider (values are provider-specific). Days are UTC dates.
+in-turn attribution: --by session/project: all in-turn time of the session; --by day: split at UTC midnight;
+--by model/effort/tier: each turn split in proportion to its responses' output; in-turn time with no response in
+the window is reported on stderr as unattributed. Claude has no turn timing: in_turn_h/out_per_turn_h are null.
+--since/--until select sessions (as elsewhere) AND clip responses by timestamp. Default: all providers, subagent
+sessions excluded; quota accounting usually wants --subagents include (Claude subagents and Codex spawned agents
+are separate sessions). A response id seen in two selected sessions (fork/resume copies) is counted once.
+Sources: Codex token_usage_record (records whose thread_id is another thread, i.e. copied into a fork, are skipped;
+rollouts older than token_usage_record fall back to token_count.last_token_usage, one row per change of the
+running total). Claude: one row per assistant message.id (split content-block records share the usage; later
+records add only changed counts); <synthetic> and imported (codex-import, pass-the-thread) records are skipped.
+Sessions parsed before usage support are re-parsed by a plain `sx ingest --sid ...` (adapter PARSER_VERSION).
+"""
+
 EXAMPLES = """\
 sx catalog                                       # refresh the full session list (light; incremental)
 sx sessions --body no --sort hist --limit 10     # busiest catalog-only sessions by typed prompts
@@ -166,6 +196,8 @@ sx search 'ㅋㅋ|헐|이게 뭐' --regex --human --project maplestory   # regex
 sx sessions --provider agy --project maplestory --subagents include   # Antigravity CLI (agy) incl. Teamwork subagents
 sx timing --since 2026-10-07T15:00Z --by session --format table   # Codex in-turn time: model / tool kinds / outage
 sx timing --project QAAI --by project --outage-min 10
+sx usage --since 2026-10-07T15:00Z --by session --format table     # tokens per session (Codex + Claude)
+sx usage --since 2026-10-07T15:00Z --provider codex --by tier --subagents include
 sx sql "SELECT type, COUNT(*) n FROM events GROUP BY type ORDER BY n DESC"
 sx sql "SELECT s.project, AVG(s.interrupts) FROM sessions s WHERE s.origin_class='interactive' GROUP BY 1"
 sx sessions --has-event rate_limit,token_pressure --sort last   # problem-signal filter
@@ -205,7 +237,7 @@ def build(sections, live: dict) -> str:
         out.append(f"db={live.get('db')} last_ingest={live.get('last_ingest')} sessions={live.get('sessions')} "
                    f"messages={live.get('messages')} events={live.get('events')}")
         out.append("Output is JSON Lines by default (--format table for humans). IDs: sid prefix or provider id prefix.")
-        out.append("Commands: guide stats sessions show read raw search sql timing note notes ingest  (sx <cmd> -h for flags)")
+        out.append("Commands: guide stats sessions show read raw search sql timing usage note notes ingest  (sx <cmd> -h for flags)")
         out.append("Workflow: 1) `sx catalog` (if the catalog is missing/old; lists EVERY session from file heads/tails + "
                    "provider/Orca metadata, no bodies)  2) `sx sessions [filters]` / `sx stats` / `sx show <sid>` on the "
                    "catalog (body=0 rows have titles, cwd, times, sizes, typed-prompt counts)  3) `sx ingest --sid a,b` "
@@ -232,6 +264,8 @@ def build(sections, live: dict) -> str:
             out.append(f"  {k}: {d}")
     if "timing" in sections:
         out.append("\n## timing (sx timing)\n" + TIMING)
+    if "usage" in sections:
+        out.append("\n## usage (sx usage)\n" + USAGE)
     if "examples" in sections:
         out.append("\n## examples\n" + EXAMPLES)
     if "caveats" in sections:

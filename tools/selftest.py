@@ -211,6 +211,108 @@ def timing_rollout(tmp):
             f"steps={sorted(full['steps'])} error_idle={full['error_idle']} window_in_turn={round(win['in_turn'], 1)} {rc}")
 
 
+def usage_cases(tmp):
+    """Synthetic Codex and Claude transcripts -> usage events: settings tracking (model/effort/tier), fork-copied
+    records skipped, token_count fallback with repeated totals, Claude split records counted once, streaming
+    output deltas across an append resume, synthetic/imported records skipped; plus in-turn attribution."""
+    import json
+    from sessionindex import usage
+    t0 = 1_800_000_000
+
+    def ts(s):
+        return timing.ms_to_iso((t0 + s) * 1000)
+
+    def rec(s, typ, pl):
+        return json.dumps({"timestamp": ts(s), "type": typ, "payload": pl}, separators=(",", ":"))
+
+    def u(i, c, o, r):
+        return {"input_tokens": i, "cached_input_tokens": c, "cache_write_input_tokens": 0, "output_tokens": o,
+                "reasoning_output_tokens": r, "total_tokens": i + o}
+
+    def tur(s, thread, rid, *a):
+        return rec(s, "token_usage_record", {"thread_id": thread, "turn_id": "t1", "response_id": rid, "usage": u(*a)})
+
+    def tc(s, tot, last):
+        return rec(s, "event_msg", {"type": "token_count", "info": {"total_token_usage": {"total_tokens": tot},
+                                                                    "last_token_usage": last}})
+
+    def tsa(s, eff, tier):
+        return rec(s, "event_msg", {"type": "thread_settings_applied", "thread_settings": {
+            "model": "gpt-x", "reasoning_effort": eff, "service_tier": tier}})
+
+    def rows(res):
+        return [(e[1], json.loads(e[3])) for e in res["events"] if e[2] == "usage"]
+
+    d_ = os.path.join(tmp, "usage")
+    os.makedirs(d_, exist_ok=True)
+
+    def parse(adapter, name, lines, subkind="main", start=0, state=None):
+        p = os.path.join(d_, name)
+        with open(p, "wb") as fh:
+            fh.write(("\n".join(lines) + "\n").encode("utf-8"))
+        c = type("C", (), {"subkind": subkind, "ctx": {}, "pkey": "x", "path": p})()
+        return ADAPTERS[adapter].parse(job_for(None, c, p, start=start, state=state)), c
+    tid = "01a00000-0000-7000-8000-000000000002"
+    meta = rec(0, "session_meta", {"id": tid, "cwd": "C:/x", "originator": "codex_cli_rs", "source": "cli"})
+    lines = [meta, tsa(1, "high", "default"), rec(2, "event_msg", {"type": "task_started", "turn_id": "t1"}),
+             rec(3, "turn_context", {"turn_id": "t1", "model": "gpt-x", "effort": "xhigh"}),
+             tur(10, tid, "r1", 1000, 800, 50, 20), tc(11, 1050, u(1000, 800, 50, 20)),
+             tur(20, "01a00000-0000-7000-8000-00000000ffff", "r0", 9999, 0, 9999, 0),   # fork copy: skipped
+             tsa(25, "xhigh", "priority"),
+             tur(30, tid, "r2", 2000, 1500, 100, 0), tc(31, 3150, u(2000, 1500, 100, 0))]
+    res, c = parse("codex", f"rollout-2026-01-01T00-00-00-{tid}.jsonl", lines)
+    cx = [(d["m"], d["e"], d["t"], d["i"], d["c"], d["o"], d["r"], d["id"]) for _, d in rows(res)]
+    ok_cx = (cx == [("gpt-x", "xhigh", "default", 1000, 800, 50, 20, "r1"),
+                    ("gpt-x", "xhigh", "priority", 2000, 1500, 100, 0, "r2")]
+             and res["rec_counts"].get("token_usage_record:foreign_thread") == 1)
+    rc_cx = resume_check(ADAPTERS["codex"], None, c, tmp)
+    # rollout without token_usage_record: token_count fallback, a repeated total is not a new response
+    old = [meta, tc(5, 1050, u(1000, 800, 50, 20)), tc(6, 1050, u(1000, 800, 50, 20)), tc(9, 3150, u(2000, 0, 100, 0))]
+    res2, _ = parse("codex", f"rollout-2026-01-01T00-00-01-{tid}.jsonl", old)
+    fb = [(d["i"], d["o"], d.get("src")) for _, d in rows(res2)]
+    ok_fb = fb == [(1000, 50, "token_count"), (2000, 100, "token_count")]
+
+    def asst(s, mid, usage_, model="claude-x", version="2.1.0", effort="high"):
+        return json.dumps({"type": "assistant", "timestamp": ts(s), "sessionId": "s", "cwd": "C:/x",
+                           "version": version, "effort": effort,
+                           "message": {"id": mid, "model": model, "role": "assistant", "usage": usage_,
+                                       "content": [{"type": "text", "text": f"m {s}"}]}})
+
+    def cu(i, cw, cr, o, think=None, speed=None):
+        d = {"input_tokens": i, "cache_creation_input_tokens": cw, "cache_read_input_tokens": cr, "output_tokens": o,
+             "service_tier": "standard"}
+        if think is not None:
+            d["output_tokens_details"] = {"thinking_tokens": think}
+        if speed:
+            d["speed"] = speed
+        return d
+    cl = [asst(1, "A", cu(2, 100, 900, 40, 10)), asst(2, "A", cu(2, 100, 900, 40, 10)),   # split records: once
+          asst(3, "B", cu(5, 0, 1000, 5)), asst(4, "B", cu(5, 0, 1000, 50)),               # streaming: +45 out
+          asst(5, "C", cu(1, 0, 0, 7, speed="fast"), effort="xhigh"),
+          asst(6, "D", cu(9, 9, 9, 9), model="<synthetic>"), asst(7, "E", cu(9, 9, 9, 9), version="codex-import")]
+    res3, _ = parse("claude", "claude-usage.jsonl", cl)
+    got = [(d["n"], d["i"], d["c"], d["w"], d["o"], d["r"], d["t"], d["e"]) for _, d in rows(res3)]
+    want = [(1, 1002, 900, 100, 40, 10, "standard", "high"), (1, 1005, 1000, 0, 5, 0, "standard", "high"),
+            (0, 0, 0, 0, 45, 0, "standard", "high"), (1, 1, 0, 0, 7, 0, "fast", "xhigh")]
+    # append resume between B's two records keeps the per-message state
+    a, _ = parse("claude", "claude-usage-a.jsonl", cl[:3])
+    p = os.path.join(d_, "claude-usage-a.jsonl")
+    with open(p, "wb") as fh:
+        fh.write(("\n".join(cl) + "\n").encode("utf-8"))
+    cc = type("C", (), {"subkind": "main", "ctx": {}, "pkey": "x", "path": p})()
+    b = ADAPTERS["claude"].parse(job_for(None, cc, p, start=a["end_offset"], state=a["state"]))
+    ok_cl = got == want and [d for _, d in rows(a) + rows(b)] == [d for _, d in rows(res3)]
+    # in-turn attribution: proportional to output within a turn, empty segment unattributed, UTC day split
+    att = usage.in_turn_by_group([(0, 100), (200, 260)], 0, 1e9, [(10, "hi", 30), (50, "lo", 10)],
+                                 lambda _d: None, "effort")
+    days = usage.day_split([(86400 * 3 - 60, 86400 * 3 + 30)])
+    ok_att = (att == {"hi": 75.0, "lo": 25.0, None: 60.0}
+              and [(round(e - s), d) for s, e, d in days] == [(60, "1970-01-03"), (30, "1970-01-04")])
+    ok = ok_cx and ok_fb and ok_cl and ok_att and "PASS" in rc_cx
+    return (f"usage (synthetic codex+claude): {'PASS' if ok else 'FAIL'} codex={ok_cx} fallback={ok_fb} "
+            f"claude={ok_cl} attribution={ok_att} codex {rc_cx}" + ("" if ok else f" cx={cx} fb={fb} cl={got} att={att}"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--per-adapter", type=int, default=4)
@@ -222,6 +324,9 @@ def main():
         print(bad_lines(t0))
         tr = timing_rollout(t0)
         print(tr)
+        ur = usage_cases(t0)
+        print(ur)
+        tr += ur
     finally:
         shutil.rmtree(t0, ignore_errors=True)
     roots = expand_roots(load_config())

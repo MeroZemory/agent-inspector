@@ -184,7 +184,7 @@ def cmd_guide(a):
         r = con.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
         live["last_ingest"] = r[0] if r else None
     secs = a.section.split(",") if a.section else ["overview", "schema", "kinds", "events", "aliases", "timing",
-                                                     "examples", "caveats"]
+                                                     "usage", "examples", "caveats"]
     sys.stdout.write(guide_mod.build(secs, live) + "\n")
 
 
@@ -662,6 +662,152 @@ def cmd_timing(a):
     o.flush()
 
 
+def cmd_usage(a):
+    from . import usage
+    con = ro()
+    o = Out(a.format)
+    if a.since:
+        a.since = _utc(a.since, "--since")
+    if a.until:
+        a.until = _utc(a.until, "--until")
+    w0 = iso_to_epoch(a.since) if a.since else float("-inf")
+    w1 = iso_to_epoch(a.until) if a.until else float("inf")
+    w, args = filter_sql(a, con)
+    sess = con.execute(f"SELECT s.sid, s.provider, s.project, s.last_activity_at, s.body FROM sessions s WHERE {w}"
+                       f" ORDER BY s.started_at", args).fetchall()
+    tw, targs = "", []
+    if a.since:
+        tw += " AND ts>=?"
+        targs.append(a.since)
+    if a.until:
+        tw += " AND ts<?"
+        targs.append(a.until)
+    owner, dups, missing, unattr = {}, 0, [], 0.0
+    buckets = {}
+
+    def bucket(k, prov):
+        b = buckets.get(k)
+        if b is None:
+            b = buckets[k] = usage.new_bucket()
+        b["providers"].add(prov)
+        return b
+
+    for sid, prov, project, last_ts, body in sess:
+        rows = con.execute(f"SELECT ts, detail FROM events WHERE sid=? AND source='transcript' AND type='usage'{tw}"
+                           f" ORDER BY ts, seq, eid", [sid] + targs).fetchall()
+        if not rows:
+            if body and not con.execute("SELECT 1 FROM events WHERE sid=? AND source='transcript' AND type='usage'"
+                                        " LIMIT 1", (sid,)).fetchone():
+                missing.append(sid)
+            continue
+        turns = usage.turn_intervals(con.execute(
+            "SELECT ts, type, detail FROM events WHERE sid=? AND source='transcript' AND type IN"
+            " ('turn_start','turn_end') ORDER BY ts, seq, eid", (sid,)).fetchall(), last_ts)
+
+        def key(d, ts):
+            if a.by == "session":
+                return sid
+            if a.by == "project":
+                return project
+            if a.by == "day":
+                return ts[:10]
+            v = d.get({"model": "m", "effort": "e", "tier": "t"}[a.by])
+            return (prov, v)  # tier/effort/model values are provider-specific (codex default|priority, claude standard|fast)
+        resp = []
+        for ts, detail in rows:
+            d = usage.parse_detail(detail)
+            if d is None:
+                continue
+            rid = d.get("id")
+            if rid:  # the same response copied into another session (fork/resume copy): count it once
+                own = owner.setdefault(rid, sid)
+                if own != sid:
+                    dups += int(d.get("n", 1) or 0)
+                    continue
+            k = key(d, ts)
+            b = bucket(k, prov)
+            b["sessions"].add(sid)
+            usage.add(b, d)
+            if turns:
+                b["timed_output"] += int(d.get("o") or 0)
+            t = iso_to_epoch(ts)
+            if t is not None:
+                resp.append((t, k, int(d.get("o") or 0)))
+        if turns:
+            for k, s in usage.in_turn_by_group(turns, w0, w1, resp, lambda _d: key({}, None), a.by).items():
+                if k is None:
+                    unattr += s
+                elif k in buckets:
+                    buckets[k]["in_turn_s"] += s
+    if missing:
+        sys.stderr.write(f"[sx] {len(missing)} selected session(s) with an ingested body have no usage events (parsed "
+                         f"before usage support): sx ingest --sid {','.join(missing[:20])}\n")
+    if dups:
+        sys.stderr.write(f"[sx] {dups} response(s) already counted in another selected session were skipped\n")
+    if unattr:
+        sys.stderr.write(f"[sx] {unattr / 3600:.2f} in-turn h had no response in the window and are not attributed "
+                         f"to any {a.by}\n")
+    grand = usage.new_bucket()
+    for b in buckets.values():
+        grand["responses"] += b["responses"]
+        for c in usage.TOKEN_COLS:
+            grand[c] += b[c]
+        grand["in_turn_s"] += b["in_turn_s"]
+        grand["timed_output"] += b["timed_output"]
+        grand["sessions"] |= b["sessions"]
+        grand["providers"] |= b["providers"]
+    gtot = grand["input"] + grand["output"]
+    meta = {}
+    if a.by in ("session", "project"):
+        for sid, prov, project, _l, _b in sess:
+            meta[sid] = (prov, project)
+
+    def row(k, b, total=False):
+        d = {}
+        if total:
+            d["total"] = True
+            d["sid" if a.by == "session" else a.by] = "(total)"
+            if a.by == "session":
+                d["project"] = None
+        elif a.by == "session":
+            d["sid"] = k
+            d["project"] = meta.get(k, (None, None))[1]
+        elif a.by in ("model", "effort", "tier"):
+            d[a.by] = k[1] if (k[1] is not None or a.format != "table") else "(unset)"
+        else:
+            d[a.by] = k
+        d["provider"] = ",".join(sorted(p for p in b["providers"] if p))
+        if a.by != "session":
+            d["sessions"] = len(b["sessions"])
+        d["responses"] = b["responses"]
+        for c in usage.TOKEN_COLS:
+            d[c] = b[c]
+        h = b["in_turn_s"] / 3600
+        d["in_turn_h"] = round(h, 2) if b["timed_output"] else None
+        d["out_per_turn_h"] = round(b["timed_output"] / h) if b["timed_output"] and h > 0 else None
+        d["share_pct"] = round(100 * (b["input"] + b["output"]) / gtot, 1) if gtot else None
+        d["out_share_pct"] = round(100 * b["output"] / grand["output"], 1) if grand["output"] else None
+        return d
+
+    rows = [row(k, b) for k, b in buckets.items()]
+    if a.by == "day":
+        rows.sort(key=lambda d: d["day"] or "")
+    else:
+        rows.sort(key=lambda d: -(d["input"] + d["output"]))
+    rows = rows[:a.limit]
+    if buckets:
+        rows.append(row(None, grand, total=True))
+    for d in rows:
+        if a.format == "table":  # tokens in millions for a readable one-line row
+            for c in usage.TOKEN_COLS:
+                d[c + "_M"] = round(d.pop(c) / 1e6, 2)
+            d.pop("total", None)
+            for c in ("in_turn_h", "out_per_turn_h", "share_pct", "out_share_pct"):
+                d[c] = d.pop(c)
+        o.emit(d)
+    o.flush()
+
+
 def cmd_catalog(a):
     from .ingest import run_ingest
     stats = run_ingest(source=a.source.split(",") if a.source else None, reparse=a.full, workers=a.workers,
@@ -698,7 +844,7 @@ def build_parser():
     sub.add_parser = _add
 
     g = sub.add_parser("guide", help="schema, kinds, events, examples, caveats")
-    g.add_argument("--section", help="comma list: overview,schema,kinds,events,aliases,timing,examples,caveats")
+    g.add_argument("--section", help="comma list: overview,schema,kinds,events,aliases,timing,usage,examples,caveats")
     g.set_defaults(fn=cmd_guide)
 
     s = sub.add_parser("stats", help="counts by provider/account/project/month/origin_class/client/kind/files/msg_kind/event/summary")
@@ -801,6 +947,12 @@ def build_parser():
     s.add_argument("--limit", type=int, default=100)
     s.add_argument("--width", type=int, default=60, help="title clip width")
     s.set_defaults(fn=cmd_timing)
+
+    s = sub.add_parser("usage", help="token usage per session/project/model/effort/tier/day (Codex, Claude)")
+    add_filters(s)
+    s.add_argument("--by", choices=["session", "project", "model", "effort", "tier", "day"], default="session")
+    s.add_argument("--limit", type=int, default=100)
+    s.set_defaults(fn=cmd_usage)
 
     s = sub.add_parser("catalog", help="light scan: list EVERY session (heads/tails + provider/Orca metadata, no bodies)")
     s.add_argument("--source", help="comma list: adapter/root id/label (default: all roots)")

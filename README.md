@@ -241,6 +241,7 @@ token-lean (compact fields, clipped text with explicit lengths, small limits); o
 | `raw <id> --seq N` / `--event EID` | original JSON line from the source file (agy: the step decoded to JSON) |
 | `search "<fts>" [filters] [--human] [--kinds] [--phrase] [--like] [--regex]` | trigram FTS with snippets; `--regex`: case-insensitive Python regex over the full stored text (scan) |
 | `timing [filters] [--by session|project] [--outage-min 20]` | Codex in-turn wall time split into model / tool kinds / compaction / outage (see "Timing") |
+| `usage [filters] [--by session|project|model|effort|tier|day]` | token usage (responses, input, cached, cache write, output, reasoning, output per in-turn hour, shares) for Codex and Claude (see "Usage") |
 | `sql "<SELECT ...>"` | read-only SQL (mode=ro + query_only; one statement; SELECT/WITH/EXPLAIN/VALUES only); `text REGEXP 'pat'` available |
 | `note <id> [--seq N] --tag T --note "..."` / `notes [id] [--tag]` | annotations |
 | `ingest [--source X] [--rebuild] [--max-jobs N]` | build/update the index |
@@ -287,6 +288,43 @@ turns), so a genuinely slow model step longer than the threshold counts as outag
 time (`wait`); a turn still open at the last record ends at that record. Claude transcripts are not covered:
 they have tool_use/tool_result timestamps and `turn_duration`, but interrupted turns write no `turn_duration` and
 compactions have no duration, so turn boundaries would be guessed.
+
+## Usage (`sx usage`, Codex and Claude)
+
+Token consumption over a window, for subscription-quota decisions:
+`sx usage --since 2026-10-07T15:00Z --by session|project|model|effort|tier|day --format table` (JSON Lines by
+default; same filters as `sx timing`; the last row is the window total). It reports tokens only and never converts
+them to money or quota: plans weight models, tiers and cached input differently.
+
+Columns: `responses`; `input` = all prompt tokens (fresh + cached reads + cache writes); `cached` = cache reads;
+`cache_write` = Claude `cache_creation_input_tokens` (Codex `cache_write_input_tokens`, 0 in every rollout seen);
+`output` **includes reasoning** for both providers (Codex `total_tokens` = input + output with
+`reasoning_output_tokens` <= output; Claude `thinking_tokens` <= `output_tokens`); `reasoning` = that part of the
+output (0 where no breakdown is recorded); `in_turn_h` = Codex turn intervals clipped to the window (same rule as
+`sx timing`); `out_per_turn_h` = output of sessions with turn timing / in_turn_h; `share_pct` = input+output share
+of the window total; `out_share_pct` = output share. `--format table` prints tokens in millions (`*_M`).
+
+* **Codex**: one row per `token_usage_record` (per response: `usage`, `response_id`, `turn_id`). Records with
+  another `thread_id` (copied into a fork) are skipped. Model / effort / service tier are the latest
+  `turn_context` (model, `effort`) or `thread_settings_applied` (model, `reasoning_effort`, `service_tier`:
+  `default`, or `priority` = Fast) before the record; tier is null (table: `(unset)`) before the first
+  `thread_settings_applied`, i.e. the first turn of a new session (it is written from the second turn on) and older
+  rollouts.
+  Rollouts older than `token_usage_record` fall back to `token_count.last_token_usage`, one row per change of the
+  running total.
+* **Claude**: one row per assistant `message.id` (a response is split into one record per content block, each
+  carrying its usage; later records only add counts that changed). `input` = `input_tokens` +
+  `cache_creation_input_tokens` + `cache_read_input_tokens`; effort = the record's `effort`; tier =
+  `usage.service_tier`, or `fast` when `usage.speed` is `fast`. `<synthetic>` and imported records are skipped.
+  There is no Claude turn timing, so `in_turn_h` / `out_per_turn_h` are null.
+
+In-turn attribution: by session/project the whole in-turn time of the session; by day split at UTC midnight; by
+model/effort/tier each turn is split in proportion to its responses' output (in-turn time with no response in the
+window is reported on stderr). Subagent sessions are excluded by default like everywhere else; quota accounting
+usually wants `--subagents include`. A response id that appears in two selected sessions is counted once.
+Rows are `usage` events (detail = compact JSON, see `sx guide --section events`), added by Codex adapter
+`PARSER_VERSION` 3 and Claude adapter `PARSER_VERSION` 2: older parses are re-parsed by the next `sx ingest`
+that selects them.
 
 ## Adding a source (e.g. Orca metadata)
 
