@@ -20,6 +20,7 @@ from sessionindex.adapters import ADAPTERS  # noqa: E402
 from sessionindex.adapters.agy import _user_kind as agy_kind  # noqa: E402
 from sessionindex.classify import claude_user_text_kind, codex_user_text_kind  # noqa: E402
 from sessionindex.config import expand_roots, load_config  # noqa: E402
+from sessionindex import timing  # noqa: E402
 
 
 def job_for(root, c, path=None, start=0, state=None):
@@ -135,6 +136,79 @@ def bad_lines(tmp):
            f"partial={res['partial_tail']})"
 
 
+def timing_rollout(tmp):
+    """Synthetic Codex rollout -> timing events -> breakdown: parallel tool overlap, compaction, threshold outage,
+    error-marked step, error turn without output, idle time between turns, window clipping, append resume."""
+    import json
+    t0 = 1_800_000_000
+
+    def ts(s):
+        return timing.ms_to_iso((t0 + s) * 1000)
+
+    def rec(s, typ, pl):
+        return json.dumps({"timestamp": ts(s), "type": typ, "payload": pl}, separators=(",", ":"))
+
+    def call(s, cid, name, args):
+        return rec(s, "response_item", {"type": "function_call", "name": name, "arguments": json.dumps(args),
+                                        "call_id": cid})
+
+    def output(s, cid):
+        return rec(s, "response_item", {"type": "function_call_output", "call_id": cid, "output": "ok"})
+
+    def ev(s, typ, **kw):
+        return rec(s, "event_msg", dict({"type": typ}, **kw))
+
+    def asst(s):
+        return rec(s, "response_item", {"type": "message", "role": "assistant",
+                                        "content": [{"type": "output_text", "text": f"done {s}"}]})
+    tid = "01a00000-0000-7000-8000-000000000001"
+    lines = [
+        rec(0, "session_meta", {"id": tid, "cwd": "C:/x", "originator": "codex_cli_rs", "source": "cli"}),
+        ev(0, "task_started", turn_id="t1"),
+        call(10, "a", "exec_command", {"cmd": "npm test"}),      # build 10-60
+        call(12, "b", "exec_command", {"cmd": "ls"}),            # shell 12-40 (overlaps a)
+        output(40, "b"), output(60, "a"),
+        asst(70),
+        ev(80, "item_completed", item={"type": "ContextCompaction", "id": "c"},
+           started_at_ms=(t0 + 72) * 1000, completed_at_ms=(t0 + 80) * 1000),
+        ev(90, "task_complete", turn_id="t1", duration_ms=90000),
+        # idle 90..1000 (waiting for the user) is not in-turn
+        ev(1000, "task_started", turn_id="t2"),
+        call(1010, "w", "wait", {"timeout_ms": 20000}), output(1030, "w"),
+        asst(2530),                                              # 1500 s model step > 20 min -> outage
+        ev(2540, "task_complete", turn_id="t2"),
+        ev(3000, "task_started", turn_id="t3"),
+        ev(3300, "task_complete", turn_id="t3", error={"message": "429"}),   # no model output -> outage in full
+        ev(4000, "task_started", turn_id="t4"),
+        ev(4005, "stream_error", message="Reconnecting... 1/5"),
+        asst(4100),                                              # step with a stream_error -> outage
+        ev(4110, "task_complete", turn_id="t4"),
+    ]
+    d = os.path.join(tmp, "timing")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, f"rollout-2026-01-01T00-00-00-{tid}.jsonl")
+    with open(p, "wb") as fh:
+        fh.write(("\n".join(lines) + "\n").encode("utf-8"))
+    c = type("C", (), {"subkind": "main", "ctx": {}, "pkey": tid, "path": p})()
+    ad = ADAPTERS["codex"]
+    res = ad.parse(job_for(None, c, p))
+    rows = [(e[1], e[2], e[3], e[4]) for e in sorted(res["events"], key=lambda e: (e[1], e[0]))
+            if e[2] in timing.TIMING_EVENTS]
+    last = ts(4110)
+    full = timing.session_breakdown(rows, last, float("-inf"), float("inf"), 1200)
+    win = timing.session_breakdown(rows, last, t0 + 2000, float("inf"), 1200)
+    want = {"in_turn": 2040, "tool": 70, "compaction": 8, "outage": 1900, "model": 62, "turns": 4,
+            "outage_turns": 1}
+    got = {k: round(full[k], 3) for k in want}
+    kinds = {k: round(v, 3) for k, v in full["kinds"].items() if v}
+    ok = (got == want and kinds == {"build": 50, "shell": 28, "wait": 20} and sorted(full["steps"]) == [10, 10, 10]
+          and round(win["in_turn"], 3) == 540 + 300 + 110 and len(timing.windows(full["outage_iv"], 1200)) == 1)
+    rc = resume_check(ad, None, c, tmp)
+    ok = ok and "PASS" in rc
+    return (f"timing breakdown (synthetic rollout): {'PASS' if ok else 'FAIL'} got={got} kinds={kinds} "
+            f"steps={sorted(full['steps'])} window_in_turn={round(win['in_turn'], 1)} {rc}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--per-adapter", type=int, default=4)
@@ -144,6 +218,8 @@ def main():
     t0 = tempfile.mkdtemp(prefix="sx-selftest-")
     try:
         print(bad_lines(t0))
+        tr = timing_rollout(t0)
+        print(tr)
     finally:
         shutil.rmtree(t0, ignore_errors=True)
     roots = expand_roots(load_config())
@@ -168,7 +244,8 @@ def main():
                 print(f"{adapter}/{c.subkind} {os.path.getsize(c.path) // 1024}KB {summarize(res)} {rc}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    print("RESULT", "FAIL" if fails else "PASS", f"({fails} resume failures)")
+    fails += "FAIL" in tr
+    print("RESULT", "FAIL" if fails else "PASS", f"({fails} resume/timing failures)")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from . import guide as guide_mod
 from .classify import HUMAN_KINDS
 from .config import ANN_PATH, DB_PATH
 from .schema import connect_ro, connect_rw, init_ann
-from .util import now_iso
+from .util import iso_to_epoch, now_iso
 
 SORTS = {
     "last": "s.last_activity_at", "started": "s.started_at", "human_chars": "s.human_chars",
@@ -113,7 +113,7 @@ def add_filters(p):
     p.add_argument("--account", help="substring of root label (codex-home, orca-acct-...)")
     p.add_argument("--subagents", choices=["exclude", "include", "only"], default="exclude")
     p.add_argument("--include-test", action="store_true", help="include test roots (probes, agentryx test homes)")
-    p.add_argument("--sid", help="restrict to one session id/prefix")
+    p.add_argument("--sid", help="restrict to these session ids/prefixes (comma list)")
     p.add_argument("--body", choices=["yes", "no", "stale"], help="body ingested (yes), catalog-only (no), stale")
 
 
@@ -164,8 +164,9 @@ def filter_sql(a, con, alias="s"):
     if not a.include_test:
         w.append(f"COALESCE({alias}.is_test,0)=0")
     if getattr(a, "sid", None):
-        w.append(f"{alias}.sid=?")
-        args.append(resolve(con, a.sid))
+        sids = [resolve(con, x) for x in a.sid.split(",") if x.strip()]
+        w.append(f"{alias}.sid IN ({','.join('?' * len(sids))})")
+        args += sids
     if getattr(a, "body", None):
         w.append({"yes": f"{alias}.body=1", "no": f"COALESCE({alias}.body,0)=0", "stale": f"{alias}.body=2"}[a.body])
     return (" AND ".join(w) if w else "1=1"), args
@@ -182,8 +183,8 @@ def cmd_guide(a):
             live[k] = con.execute(q).fetchone()[0]
         r = con.execute("SELECT value FROM meta WHERE key='last_ingest'").fetchone()
         live["last_ingest"] = r[0] if r else None
-    secs = a.section.split(",") if a.section else ["overview", "schema", "kinds", "events", "aliases", "examples",
-                                                     "caveats"]
+    secs = a.section.split(",") if a.section else ["overview", "schema", "kinds", "events", "aliases", "timing",
+                                                     "examples", "caveats"]
     sys.stdout.write(guide_mod.build(secs, live) + "\n")
 
 
@@ -591,6 +592,76 @@ def cmd_notes(a):
     o.flush(80)
 
 
+def _utc(s, flag):
+    """'YYYY-MM-DD[THH:MM[:SS]][Z|+hh:mm]' -> canonical UTC ISO string (sorts against stored timestamps)."""
+    import datetime as dt
+    try:
+        d = dt.datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except ValueError:
+        die(f"{flag}: expected an ISO date/time (e.g. 2026-10-07 or 2026-10-07T15:00Z), got '{s}'")
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def cmd_timing(a):
+    from . import timing
+    con = ro()
+    o = Out(a.format)
+    if a.since:
+        a.since = _utc(a.since, "--since")
+    if a.until:
+        a.until = _utc(a.until, "--until")
+    w0 = iso_to_epoch(a.since) if a.since else float("-inf")
+    w1 = iso_to_epoch(a.until) if a.until else float("inf")
+    if not a.provider:
+        a.provider = "codex"
+    w, args = filter_sql(a, con)
+    sess = con.execute(f"SELECT s.sid, s.project, s.title, s.last_activity_at, s.body FROM sessions s WHERE {w}"
+                       f" ORDER BY s.last_activity_at DESC", args).fetchall()
+    types = ",".join(f"'{t}'" for t in timing.TIMING_EVENTS)
+    parts, missing = {}, []
+    for sid, project, title, last_ts, body in sess:
+        rows = con.execute(f"SELECT ts, type, detail, value FROM events WHERE sid=? AND source='transcript' AND"
+                           f" type IN ({types}) ORDER BY ts, seq, eid", (sid,)).fetchall()
+        if not rows:
+            if body:
+                missing.append(sid)
+            continue
+        r = timing.session_breakdown(rows, last_ts, w0, w1, a.outage_min * 60)
+        if r and r["in_turn"] > 0:
+            parts[sid] = (project, title, r)
+    if missing:
+        sys.stderr.write(f"[sx] {len(missing)} selected session(s) have no timing events (no turns, or parsed before "
+                         f"timing support): sx ingest --sid {','.join(missing[:20])}\n")
+    if a.by == "project":
+        groups = {}
+        for sid, (project, title, r) in parts.items():
+            groups.setdefault(project, []).append(r)
+        rows = []
+        for project, rs in groups.items():
+            d = {"project": project, "sessions": len(rs)}
+            d.update(timing.summarize(rs))
+            d["outage_windows"] = timing.windows([x for r in rs for x in r["outage_iv"]], a.outage_min * 60)
+            rows.append(d)
+    else:
+        rows = []
+        for sid, (project, title, r) in parts.items():
+            d = {"sid": sid, "project": project, "title": clip(title, a.width)}
+            d.update(timing.summarize([r]))
+            d["outage_windows"] = timing.windows(r["outage_iv"], a.outage_min * 60)
+            rows.append(d)
+    rows.sort(key=lambda d: -d["in_turn_h"])
+    for d in rows[:a.limit]:
+        if a.format == "table":  # one line per row: first/last outage window instead of the list
+            ws = d.pop("outage_windows", None) or []
+            d["outage_first"] = ws[0]["first"][:16] if ws else None
+            d["outage_last"] = ws[-1]["last"][:16] if ws else None
+            d.pop("title", None)
+        o.emit(d)
+    o.flush()
+
+
 def cmd_catalog(a):
     from .ingest import run_ingest
     stats = run_ingest(source=a.source.split(",") if a.source else None, reparse=a.full, workers=a.workers,
@@ -627,7 +698,7 @@ def build_parser():
     sub.add_parser = _add
 
     g = sub.add_parser("guide", help="schema, kinds, events, examples, caveats")
-    g.add_argument("--section", help="comma list: overview,schema,kinds,events,aliases,examples,caveats")
+    g.add_argument("--section", help="comma list: overview,schema,kinds,events,aliases,timing,examples,caveats")
     g.set_defaults(fn=cmd_guide)
 
     s = sub.add_parser("stats", help="counts by provider/account/project/month/origin_class/client/kind/files/msg_kind/event/summary")
@@ -721,6 +792,15 @@ def build_parser():
     s.add_argument("--author")
     s.add_argument("--limit", type=int, default=50)
     s.set_defaults(fn=cmd_notes)
+
+    s = sub.add_parser("timing", help="in-turn wall time: model vs tool kinds vs compaction vs outage (Codex)")
+    add_filters(s)
+    s.add_argument("--by", choices=["session", "project"], default="session")
+    s.add_argument("--outage-min", type=float, default=20.0,
+                   help="a model step longer than this many minutes counts as outage (default 20)")
+    s.add_argument("--limit", type=int, default=100)
+    s.add_argument("--width", type=int, default=60, help="title clip width")
+    s.set_defaults(fn=cmd_timing)
 
     s = sub.add_parser("catalog", help="light scan: list EVERY session (heads/tails + provider/Orca metadata, no bodies)")
     s.add_argument("--source", help="comma list: adapter/root id/label (default: all roots)")

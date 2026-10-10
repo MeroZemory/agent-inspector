@@ -40,6 +40,11 @@ EVENT_DOCS = {
     "external_file_edit": "Claude noticed a file edited outside the model (by the user or a tool). detail=filename.",
     "turn_duration": "Duration of a model turn in ms (Claude system turn_duration; Codex task_complete.duration_ms). value=ms.",
     "warning": "Codex warning event.",
+    "turn_start": "(timing, Codex) task_started. detail=turn id. Used by `sx timing`; excluded from sessions.events_n.",
+    "turn_end": "(timing, Codex) task_complete | turn_aborted | next task_started. value=duration_ms; detail='complete|aborted:<reason>|superseded out=<model outputs in the turn> err=<task_complete error 0|1>'.",
+    "tool_span": "(timing, Codex) one tool call: ts=call, value=seconds until its output; detail='<kind> <call_id>', kind build|shell|wait|subagent|web|edit|other (see `sx guide --section timing`).",
+    "compaction_span": "(timing, Codex) ContextCompaction item: ts=started_at_ms, value=seconds.",
+    "model_step": "(timing, Codex) model input (turn start / tool output) to the next tool call or assistant message, or to the turn end when no tool call of the turn is open. ts=input; value=seconds; detail='<tool_call|assistant|turn_end|turn_end_error> err=<error+stream_error events inside>'.",
     "agents_killed": "Claude background agents killed.",
     "state_turn_failed": "(source home:*) Codex state DB thread_turns status=failed; detail='[turn <turn_id>] <error_json>' (turn id keeps distinct turns distinct across home copies). Not counted in sessions.errors.",
     "state_turn_interrupted": "(source home:*) Codex state DB thread_turns status=interrupted; detail='[turn <turn_id>]'. Overlaps transcript 'interrupt'; not counted in sessions.interrupts.",
@@ -115,6 +120,30 @@ SCHEMA_DOCS = {
     "messages_fts": [("text", "FTS5 trigram index over view fts_src: full text for prompts/assistant/reasoning; tool_call first 512 chars; tool_output: stored text if is_error=1, else first 256 + last 512 chars; developer/context_injection/system_reminder/meta/command_expansion/hook_output not indexed (use --like or sql LIKE)")],
 }
 
+TIMING = """\
+`sx timing [filters] [--by session|project] [--outage-min 20]` splits the IN-TURN wall time of Codex sessions
+(task_started -> task_complete/turn_aborted; idle time waiting for the user is excluded) into parts that add up:
+  tool       union of tool-call intervals (call -> output; parallel calls overlap, so the union is used)
+  compaction ContextCompaction item durations not under a tool call
+  outage     whole turns with no model output (no tool call, assistant message or reasoning: e.g. 429 loops whose
+             turns end in an error) + model steps longer than --outage-min, containing a Codex `error`/`stream_error`
+             event, or ending the turn with a task_complete error; minus tool and compaction
+  model      the rest: in-turn time with no tool call outstanding = generation + network + proxy
+Columns: in_turn_h, model_pct, tool_pct, per tool kind *_pct (build = shell running npm/vite/vitest/playwright/
+pytest/unittest/cargo/dotnet/ffmpeg/blender/render/tsc/python script...; shell = other exec_command/write_stdin;
+wait = wait/sleep/multi-agent wait, i.e. background cells and subagents; subagent = other multi_agent_v1__* control;
+web = web__run; edit = apply_patch; other), compaction_pct, outage_h/pct, model_steps + step_median_s/p90_s
+(non-outage model steps: input -> first model output), turns, outage_turns, outage_windows (outage intervals merged
+across gaps < --outage-min; table shows first/last). --since/--until select sessions (as elsewhere) AND clip the
+window (accepts 2026-10-07T15:00Z). Defaults: --provider codex, subagents excluded (--subagents include).
+Caveats: model time includes network/proxy latency and client-side streaming; outages are inferred (threshold +
+error events + output-less turns), so a genuinely slow >threshold model step counts as outage; background waits
+count as tool time (kind wait), not model; per-kind shares overlap; a turn still open at the last record ends there.
+Codex only: Claude transcripts have tool_use/tool_result timestamps and turn_duration, but interrupted
+turns write no turn_duration and compaction has no duration, so turn boundaries would be guessed; not implemented.
+Sessions parsed before timing support are re-parsed by a plain `sx ingest --sid ...` (adapter PARSER_VERSION).
+"""
+
 EXAMPLES = """\
 sx catalog                                       # refresh the full session list (light; incremental)
 sx sessions --body no --sort hist --limit 10     # busiest catalog-only sessions by typed prompts
@@ -131,6 +160,8 @@ sx search '"다시 해"' --human --limit 20         # Korean phrase in human mes
 sx search 'rate limit' --kinds tool_output,api_error
 sx search 'ㅋㅋ|헐|이게 뭐' --regex --human --project maplestory   # regex (case-insensitive) over full text, human only
 sx sessions --provider agy --project maplestory --subagents include   # Antigravity CLI (agy) incl. Teamwork subagents
+sx timing --since 2026-10-07T15:00Z --by session --format table   # Codex in-turn time: model / tool kinds / outage
+sx timing --project QAAI --by project --outage-min 10
 sx sql "SELECT type, COUNT(*) n FROM events GROUP BY type ORDER BY n DESC"
 sx sql "SELECT s.project, AVG(s.interrupts) FROM sessions s WHERE s.origin_class='interactive' GROUP BY 1"
 sx sessions --has-event rate_limit,token_pressure --sort last   # problem-signal filter
@@ -170,7 +201,7 @@ def build(sections, live: dict) -> str:
         out.append(f"db={live.get('db')} last_ingest={live.get('last_ingest')} sessions={live.get('sessions')} "
                    f"messages={live.get('messages')} events={live.get('events')}")
         out.append("Output is JSON Lines by default (--format table for humans). IDs: sid prefix or provider id prefix.")
-        out.append("Commands: guide stats sessions show read raw search sql note notes ingest  (sx <cmd> -h for flags)")
+        out.append("Commands: guide stats sessions show read raw search sql timing note notes ingest  (sx <cmd> -h for flags)")
         out.append("Workflow: 1) `sx catalog` (if the catalog is missing/old; lists EVERY session from file heads/tails + "
                    "provider/Orca metadata, no bodies)  2) `sx sessions [filters]` / `sx stats` / `sx show <sid>` on the "
                    "catalog (body=0 rows have titles, cwd, times, sizes, typed-prompt counts)  3) `sx ingest --sid a,b` "
@@ -195,6 +226,8 @@ def build(sections, live: dict) -> str:
         out.append("\n## alias origins")
         for k, d in ALIAS_ORIGINS.items():
             out.append(f"  {k}: {d}")
+    if "timing" in sections:
+        out.append("\n## timing (sx timing)\n" + TIMING)
     if "examples" in sections:
         out.append("\n## examples\n" + EXAMPLES)
     if "caveats" in sections:

@@ -240,13 +240,48 @@ token-lean (compact fields, clipped text with explicit lengths, small limits); o
 | `read <id> [--seq a-b] [--turn a-b] [--kinds ...] [--no-tools] [--full]` | messages |
 | `raw <id> --seq N` / `--event EID` | original JSON line from the source file (agy: the step decoded to JSON) |
 | `search "<fts>" [filters] [--human] [--kinds] [--phrase] [--like] [--regex]` | trigram FTS with snippets; `--regex`: case-insensitive Python regex over the full stored text (scan) |
+| `timing [filters] [--by session|project] [--outage-min 20]` | Codex in-turn wall time split into model / tool kinds / compaction / outage (see "Timing") |
 | `sql "<SELECT ...>"` | read-only SQL (mode=ro + query_only; one statement; SELECT/WITH/EXPLAIN/VALUES only); `text REGEXP 'pat'` available |
 | `note <id> [--seq N] --tag T --note "..."` / `notes [id] [--tag]` | annotations |
 | `ingest [--source X] [--rebuild] [--max-jobs N]` | build/update the index |
 
 Filters (sessions/search/stats): `--provider --project --cwd --alias --since --until --min-human
 --min-human-chars --has-event --origin-class --client --account --subagents exclude|include|only
---include-test --sid`.
+--include-test --sid` (`--sid` takes a comma list).
+
+## Timing (`sx timing`, Codex only)
+
+Where do long Codex sessions spend wall time? `sx timing --since 2026-10-07T15:00Z --by session --format table`
+reports, per session (or `--by project`), the **in-turn** time (task_started -> task_complete / turn_aborted /
+next task_started; idle time waiting for the user is excluded) split into parts that add up to it, with precedence
+tool > compaction > outage > model:
+
+* **tool** - union of tool-call intervals (call timestamp -> output timestamp; parallel calls overlap, so the
+  union is used), plus per-kind shares (which can overlap each other): `build` (shell running npm/npx/pnpm/yarn,
+  vite, vitest, playwright, pytest, unittest, cargo, dotnet, msbuild, gradle, ffmpeg, blender, render, tsc, eslint,
+  node/python scripts), `shell` (other `exec_command`/`write_stdin`), `wait` (wait/sleep and multi-agent wait:
+  background cells and subagents), `subagent` (other `multi_agent_v1__*` control), `web` (`web__run`), `edit`
+  (`apply_patch`), `other`. The kind is read from the call name and its input (code-mode calls name inner tools).
+* **compaction** - ContextCompaction item durations (`started_at_ms` -> `completed_at_ms`).
+* **outage** - whole turns with no model output at all (no tool call, assistant message or reasoning; e.g. goal
+  loops whose turns end in a 429 error), plus model steps longer than `--outage-min` (default 20), containing a
+  Codex `error`/`stream_error` event, or ending the turn with a `task_complete` error. Per session the merged
+  outage windows (first/last timestamp) are listed so they can be cross-checked across sessions.
+* **model** - the rest: in-turn time with no tool call outstanding (generation, network, proxy).
+
+A model step runs from a model input (turn start or tool output) to the next tool call or assistant message, or
+to the turn end when no tool call of the turn is still open (trailing segment). Steps that are not outage give
+`model_steps`, `step_median_s` and `step_p90_s`.
+
+The Codex adapter records the needed signals as transcript events (`turn_start`, `turn_end`, `tool_span`,
+`compaction_span`, `model_step`; definitions in `sx guide --section events`; excluded from `sessions.events_n`).
+`PARSER_VERSION` in the adapter is stored in each file's parse state; files parsed by an older version are fully
+re-parsed by the next `sx ingest` that selects them (instead of appended), so timing rows always cover whole files.
+Caveats: model time includes network and proxy latency; outages are inferred (threshold, error events, output-less
+turns), so a genuinely slow model step longer than the threshold counts as outage; background waits count as tool
+time (`wait`); a turn still open at the last record ends at that record. Claude transcripts are not covered:
+they have tool_use/tool_result timestamps and `turn_duration`, but interrupted turns write no `turn_duration` and
+compactions have no duration, so turn boundaries would be guessed.
 
 ## Adding a source (e.g. Orca metadata)
 
