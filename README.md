@@ -269,6 +269,11 @@ tool > compaction > outage > model:
   outage windows (first/last timestamp) are listed so they can be cross-checked across sessions.
 * **model** - the rest: in-turn time with no tool call outstanding (generation, network, proxy).
 
+Outside the in-turn total and the percentages: **error_idle_h** = for each turn that ended with a `task_complete`
+error or without model output, the gap to the next `task_started` of the session (goal sessions keep retrying the
+stream there without writing to the rollout); **lost_h** = outage_h + error_idle_h. error_idle may include
+deliberate user stops right after an errored turn.
+
 A model step runs from a model input (turn start or tool output) to the next tool call or assistant message, or
 to the turn end when no tool call of the turn is still open (trailing segment). Steps that are not outage give
 `model_steps`, `step_median_s` and `step_p90_s`.

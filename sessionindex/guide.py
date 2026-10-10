@@ -129,6 +129,10 @@ TIMING = """\
              turns end in an error) + model steps longer than --outage-min, containing a Codex `error`/`stream_error`
              event, or ending the turn with a task_complete error; minus tool and compaction
   model      the rest: in-turn time with no tool call outstanding = generation + network + proxy
+Not in-turn and not in any percentage: error_idle_h = for each turn that ended with a task_complete error or without
+model output, the gap to the next task_started of the session (goal sessions keep retrying the stream there without
+writing to the rollout, e.g. 429 limit loops); lost_h = outage_h + error_idle_h. error_idle may include deliberate
+user stops right after an errored turn; a session's last errored turn has no next start and adds nothing.
 Columns: in_turn_h, model_pct, tool_pct, per tool kind *_pct (build = shell running npm/vite/vitest/playwright/
 pytest/unittest/cargo/dotnet/ffmpeg/blender/render/tsc/python script...; shell = other exec_command/write_stdin;
 wait = wait/sleep/multi-agent wait, i.e. background cells and subagents; subagent = other multi_agent_v1__* control;

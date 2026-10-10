@@ -202,11 +202,13 @@ def timing_rollout(tmp):
     got = {k: round(full[k], 3) for k in want}
     kinds = {k: round(v, 3) for k, v in full["kinds"].items() if v}
     ok = (got == want and kinds == {"build": 50, "shell": 28, "wait": 20} and sorted(full["steps"]) == [10, 10, 10]
+          and round(full["error_idle"], 3) == 700 and round(win["error_idle"], 3) == 700
+          and round(timing.session_breakdown(rows, last, t0 + 3500, float("inf"), 1200)["error_idle"], 3) == 500
           and round(win["in_turn"], 3) == 540 + 300 + 110 and len(timing.windows(full["outage_iv"], 1200)) == 1)
     rc = resume_check(ad, None, c, tmp)
     ok = ok and "PASS" in rc
     return (f"timing breakdown (synthetic rollout): {'PASS' if ok else 'FAIL'} got={got} kinds={kinds} "
-            f"steps={sorted(full['steps'])} window_in_turn={round(win['in_turn'], 1)} {rc}")
+            f"steps={sorted(full['steps'])} error_idle={full['error_idle']} window_in_turn={round(win['in_turn'], 1)} {rc}")
 
 
 def main():

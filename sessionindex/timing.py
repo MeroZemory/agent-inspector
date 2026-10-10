@@ -17,6 +17,8 @@ tool > compaction > outage > model, so the parts add up to the in-turn time:
   outage     = (whole turns with no model output) + (model steps longer than the threshold, containing an
                error/stream_error event, or ending in a task_complete error), minus tool and compaction
   model      = the rest: in-turn time with no tool outstanding (generation, network, proxy)
+Outside the in-turn total (not in any percentage): error_idle = gap from the end of a turn that ended with a
+task_complete error or without model output to the next task_started; lost = outage + error_idle.
 Tool kinds overlap each other (parallel calls), so per-kind shares can sum to more than the tool share.
 """
 from __future__ import annotations
@@ -160,13 +162,20 @@ def session_breakdown(rows, last_ts, w0, w1, outage_s):
         elif w0 <= s < w1:
             good_steps.append(e - s)
     outage = subtract(subtract(intersect(merge(out_iv), in_turn), tool), compaction)
+    # error idle: after a turn that ended with a task_complete error or without model output, the gap to the next
+    # task_started (goal sessions keep retrying the stream there without writing to the rollout); not in-turn
+    err_gap = []
+    for i, (s, e, out, err) in enumerate(turns[:-1]):
+        if err or out == 0:
+            err_gap.append((e, turns[i + 1][0]))
+    error_idle = total(intersect(merge(err_gap), win))
     n_turns = sum(1 for s, e, _, _ in turns if s < w1 and e > w0)
     n_dead = sum(1 for s, e in dead_turns if s < w1 and e > w0)
     T = total(in_turn)
     return {"in_turn": T, "tool": total(tool), "compaction": total(compaction), "outage": total(outage),
             "model": max(0.0, T - total(tool) - total(compaction) - total(outage)),
             "kinds": {k: total(v) for k, v in tool_by.items()}, "steps": good_steps, "turns": n_turns,
-            "outage_turns": n_dead, "outage_iv": outage}
+            "outage_turns": n_dead, "outage_iv": outage, "error_idle": error_idle}
 
 
 def windows(iv, gap_s):
@@ -185,7 +194,7 @@ def windows(iv, gap_s):
 def summarize(parts: list[dict]) -> dict:
     """Sum session breakdowns (a project = sum of its sessions) into report fields."""
     agg = {"in_turn": 0.0, "tool": 0.0, "compaction": 0.0, "outage": 0.0, "model": 0.0, "turns": 0,
-           "outage_turns": 0}
+           "outage_turns": 0, "error_idle": 0.0}
     kinds = {k: 0.0 for k in TOOL_KINDS}
     steps = []
     for p in parts:
@@ -203,7 +212,8 @@ def summarize(parts: list[dict]) -> dict:
     for k in TOOL_KINDS:
         d[f"{k}_pct"] = pct(kinds[k])
     d.update({"compaction_pct": pct(agg["compaction"]), "outage_h": round(agg["outage"] / 3600, 2),
-              "outage_pct": pct(agg["outage"]), "model_steps": len(st),
+              "outage_pct": pct(agg["outage"]), "error_idle_h": round(agg["error_idle"] / 3600, 2),
+              "lost_h": round((agg["outage"] + agg["error_idle"]) / 3600, 2), "model_steps": len(st),
               "step_median_s": round(statistics.median(st), 1) if st else None,
               "step_p90_s": round(st[int(len(st) * 0.9)], 1) if st else None,
               "turns": agg["turns"], "outage_turns": agg["outage_turns"]})
