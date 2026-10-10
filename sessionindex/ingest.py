@@ -366,6 +366,9 @@ def _run_ingest(source: list[str] | None = None, rebuild: bool = False, workers:
             mode = "append"
         else:
             mode = "full"
+        pv = getattr(ADAPTERS[canon["root"].adapter], "PARSER_VERSION", None)
+        if mode != "full" and pv is not None and r[10] and json.loads(r[10]).get("pv") != pv:
+            mode = "full"  # parsed by an older adapter version: re-parse so new row types cover the whole file
         if mode:
             st = json.loads(r[10]) if (mode == "append" and r[10]) else None
             jobs.append({"sid": sid, "file_id": file_id, "mode": mode, "size": canon["size"],
@@ -977,7 +980,8 @@ def _finalize(con, touched, group_info, root_by_id):
     for row in con.execute(
             "SELECT sid, SUM(type IN ('tool_error','tool_aborted')), SUM(type IN ('api_error','rate_limit','turn_error')),"
             " SUM(type='interrupt'), SUM(type='compaction'), SUM(type='subagent_spawn'), SUM(type='tool_denied'),"
-            " COUNT(*) FROM events WHERE source='transcript' AND sid IN (SELECT sid FROM touched) GROUP BY sid"):
+            " SUM(type NOT IN ('turn_start','turn_end','tool_span','compaction_span','model_step'))"  # timing rows: sx timing
+            " FROM events WHERE source='transcript' AND sid IN (SELECT sid FROM touched) GROUP BY sid"):
         ev[row[0]] = list(row[1:])
     # active time: sum of inter-message gaps <= 30 min
     active = collections.defaultdict(float)

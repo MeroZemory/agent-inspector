@@ -14,10 +14,14 @@ import re
 import sqlite3
 
 from ..classify import codex_user_text_kind
+from ..timing import tool_kind
 from ..util import iso_to_epoch, norm_ts, jdump, text_hash, ms_to_iso
 from .base import Candidate, ParseOut, read_lines
 
 PROVIDER = "codex"
+# bump when parse() starts emitting new rows: ingest re-parses files whose stored state has another version
+# (2: timing events turn_start/turn_end/tool_span/compaction_span/model_step)
+PARSER_VERSION = 2
 ROLLOUT_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 HDR = re.compile(rb'^\{"timestamp":"([^"]*)",(?:"ordinal":(\d+),)?"type":"([a-z_]+)"(?:,"payload":\{"type":"([a-z_]+)")?')
 ITEM_TYPE = re.compile(rb'"item":\{"type":"([A-Za-z]+)"')
@@ -197,6 +201,25 @@ def parse(job) -> dict:
     nonint = st.get("nonint", False)
     cmp_t = st.get("cmp_t")  # epoch of the last `compacted` record
     rate_max = st.get("rate_max")
+    st["pv"] = PARSER_VERSION
+    # timing state (see sessionindex/timing.py): open turn, model input waiting for output, open tool calls
+    tm = st.setdefault("tm", {"turn": None, "inp": None, "err": 0, "out": 0, "open": [], "calls": {}})
+
+    def step_end(ts, end, off):
+        """Close the open model step (model input -> first model output / turn end)."""
+        a, b = iso_to_epoch(tm["inp"]), iso_to_epoch(ts)
+        if a is not None and b is not None:
+            out.ev(tm["inp"], "model_step", f"{end} err={tm['err']}", round(b - a, 3), off=off)
+        tm["inp"] = None
+        tm["err"] = 0
+
+    def turn_close(ts, how, off, dur=None, err=False):
+        if tm["turn"] is None:
+            return
+        if tm["inp"] is not None and not tm["open"]:  # trailing segment of the turn is a model step too
+            step_end(ts, "turn_end_error" if err else "turn_end", off)
+        out.ev(ts, "turn_end", f"{how} out={tm['out']} err={int(err)}", dur, off=off)
+        tm.update({"turn": None, "inp": None, "err": 0, "out": 0, "open": []})
 
     def dup_parts(parts, source) -> bool:
         """Reasoning summaries arrive as one event per part but as a part list in response_item/item:
@@ -245,7 +268,7 @@ def parse(job) -> dict:
                 im = ITEM_TYPE.search(raw[:600])
                 itype = im.group(1).decode() if im else None
                 out.rec_counts[f"item_completed:{itype}"] += 1
-                if itype not in UNION_ITEMS and not (itype in ("CommandExecution", "McpToolCall", "FileChange")
+                if itype not in UNION_ITEMS and itype != "ContextCompaction" and not (itype in ("CommandExecution", "McpToolCall", "FileChange")
                                                      and FAIL_STATUS.search(raw)):
                     continue
             else:
@@ -337,6 +360,9 @@ def parse(job) -> dict:
                 role = pl.get("role")
                 content = pl.get("content")
                 if role == "assistant":
+                    if tm["inp"] is not None:
+                        step_end(ts, "assistant", off)
+                    tm["out"] += 1
                     txt = _content_text(content)
                     if not pair.seen_elsewhere(text_hash(txt), "response_item"):
                         last_asst_row = out.msg(ts, "assistant", "assistant", txt, off=off, line=this_line,
@@ -376,6 +402,7 @@ def parse(job) -> dict:
                     out.msg(ts, role or "system", "system", _content_text(content), off=off, line=this_line,
                             count_turn=False)
             elif it == "reasoning":
+                tm["out"] += 1
                 sm = pl.get("summary")
                 parts = [b.get("text") or "" for b in sm if isinstance(b, dict)] if isinstance(sm, list) else []
                 if not any(p.strip() for p in parts):
@@ -401,6 +428,13 @@ def parse(job) -> dict:
                 if not isinstance(args, str):
                     args = jdump(args)
                 calls[cid] = name
+                if tm["inp"] is not None:
+                    step_end(ts, "tool_call", off)
+                tm["out"] += 1
+                if it in ("function_call", "custom_tool_call", "local_shell_call") and cid and ts:
+                    tm["calls"][cid] = [ts, tool_kind(pl.get("name") or name, args)]
+                    if tm["turn"] is not None:
+                        tm["open"].append(cid)
                 last_asst_row = out.msg(ts, "assistant", "tool_call", args, off=off, line=this_line,
                                         tool_name=name, tool_id=cid, model=st.get("model"))
                 if name in ("spawn_agent", "spawn_agents"):
@@ -415,6 +449,16 @@ def parse(job) -> dict:
                         "tool_search_output"):
                 cid = pl.get("call_id")
                 name = calls.get(cid)
+                c = tm["calls"].pop(cid, None)
+                if c and ts:
+                    a, b = iso_to_epoch(c[0]), iso_to_epoch(ts)
+                    if a is not None and b is not None:
+                        out.ev(c[0], "tool_span", f"{c[1]} {cid}", round(b - a, 3), off=off)
+                if cid in tm["open"]:
+                    tm["open"].remove(cid)
+                if tm["turn"] is not None and ts:
+                    tm["inp"] = ts
+                    tm["err"] = 0
                 o = pl.get("output")
                 if isinstance(o, dict):
                     txt = o.get("content") if isinstance(o.get("content"), str) else jdump(o)
@@ -460,23 +504,35 @@ def parse(job) -> dict:
                 if prim is not None:
                     rate_max = max(rate_max or 0, prim)
             elif et == "task_started":
+                turn_close(ts, "superseded", off)
+                if ts:
+                    tm["turn"] = ts
+                    tm["inp"] = ts
+                    out.ev(ts, "turn_start", pl.get("turn_id") or (pl.get("turn_attribution") or {}).get("turn_id"),
+                           off=off)
                 st["turn_id"] = pl.get("turn_id")
                 if pl.get("model_context_window"):
                     st["ctx_window"] = pl.get("model_context_window")
             elif et == "task_complete":
+                turn_close(ts, "complete", off, pl.get("duration_ms"), bool(pl.get("error")))
                 if pl.get("duration_ms") is not None:
                     out.ev(ts, "turn_duration", None, pl.get("duration_ms"), off=off)
                 if pl.get("error"):
                     out.ev(ts, "turn_error", jdump(pl.get("error"))[:300], off=off)
             elif et == "turn_aborted":
                 reason = pl.get("reason")
+                turn_close(ts, f"aborted:{reason}", off, pl.get("duration_ms"))
                 out.ev(ts, "interrupt" if reason == "interrupted" else "turn_aborted", reason, pl.get("duration_ms"),
                        off=off)
             elif et == "error":
+                if tm["inp"] is not None:
+                    tm["err"] += 1
                 msg = str(pl.get("message") or "")
                 out.ev(ts, "rate_limit" if LIMIT_RE.search(msg) else "api_error",
                        f"{pl.get('codex_error_info') or ''} {msg[:250]}".strip(), off=off)
             elif et == "stream_error":
+                if tm["inp"] is not None:
+                    tm["err"] += 1
                 out.ev(ts, "stream_retry", str(pl.get("message") or "")[:250], off=off)
             elif et in ("warning", "guardian_warning"):
                 out.ev(ts, "warning", str(pl.get("message") or "")[:250], off=off)
@@ -541,6 +597,13 @@ def parse(job) -> dict:
                     if not dup_parts(parts, "item"):
                         out.msg(ts, "assistant", "reasoning", "\n".join(p for p in parts if p.strip()), off=off,
                                 line=this_line, model=st.get("model"), origin="item")
+                elif itype == "ContextCompaction":
+                    try:
+                        a, b = int(pl.get("started_at_ms")), int(pl.get("completed_at_ms"))
+                    except (TypeError, ValueError):
+                        a = b = None
+                    if a and b and b >= a:
+                        out.ev(ms_to_iso(a), "compaction_span", None, round((b - a) / 1000, 3), off=off)
                 elif itype in ("CommandExecution", "McpToolCall", "FileChange"):
                     status = item.get("status")
                     what = item.get("command") or item.get("tool") or item.get("changes")
@@ -555,6 +618,8 @@ def parse(job) -> dict:
     st["pair"] = pair.dump()
     if len(calls) > 400:
         st["calls"] = dict(list(calls.items())[-400:])
+    if len(tm["calls"]) > 400:
+        tm["calls"] = dict(list(tm["calls"].items())[-400:])
     st["lines"] = line_no
     st["cmp_t"] = cmp_t
     st["rate_max"] = rate_max
