@@ -980,7 +980,7 @@ def _finalize(con, touched, group_info, root_by_id):
     for row in con.execute(
             "SELECT sid, SUM(type IN ('tool_error','tool_aborted')), SUM(type IN ('api_error','rate_limit','turn_error')),"
             " SUM(type='interrupt'), SUM(type='compaction'), SUM(type='subagent_spawn'), SUM(type='tool_denied'),"
-            " SUM(type NOT IN ('turn_start','turn_end','tool_span','compaction_span','model_step'))"  # timing rows: sx timing
+            " SUM(type NOT IN ('turn_start','turn_end','tool_span','compaction_span','model_step','usage'))"  # sx timing/usage rows
             " FROM events WHERE source='transcript' AND sid IN (SELECT sid FROM touched) GROUP BY sid"):
         ev[row[0]] = list(row[1:])
     # active time: sum of inter-message gaps <= 30 min

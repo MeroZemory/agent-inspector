@@ -14,6 +14,9 @@ from ..util import iso_to_epoch, norm_ts, jdump, ms_to_iso
 from .base import CAT_BYTES, Candidate, ParseOut, read_head_tail, read_lines
 
 PROVIDER = "claude"
+# bump when parse() starts emitting new rows: ingest re-parses files whose stored state has another version
+# (2: usage events, see sessionindex/usage.py)
+PARSER_VERSION = 2
 TOKENS_LEFT_RE = re.compile(r"<total_tokens>\s*(\d+)")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 AGENT_RE = re.compile(r"^agent-(.+)\.jsonl$")
@@ -142,6 +145,8 @@ def parse(job) -> dict:
     meta = out.meta
     tools = st.setdefault("tools", {})
     out_by_id = st.setdefault("out_by_id", {})
+    u_by_id = st.setdefault("u_by_id", {})  # message id -> usage already emitted (split records of one response)
+    st["pv"] = PARSER_VERSION
     models = collections.Counter()
     first_ts = last_ts = None
     cwd = git_branch = version = entrypoint = user_type = None
@@ -297,6 +302,26 @@ def parse(job) -> dict:
                     newv = usage.get("output_tokens") or 0
                     out_delta += newv - out_by_id.get(mid, 0)
                     out_by_id[mid] = newv
+                if model and model != "<synthetic>" and not imported:
+                    # one API response is written as one record per content block, all carrying its usage:
+                    # the first record counts the response, later ones only add what changed (usually nothing)
+                    od = usage.get("output_tokens_details") or {}
+                    vals = [ctxt, usage.get("cache_read_input_tokens") or 0,
+                            usage.get("cache_creation_input_tokens") or 0, usage.get("output_tokens") or 0,
+                            (od.get("thinking_tokens") or 0) if isinstance(od, dict) else 0]
+                    prev = u_by_id.get(mid) if mid else None
+                    dv = [a - b for a, b in zip(vals, prev)] if prev else vals
+                    if mid:
+                        u_by_id[mid] = vals
+                    if prev is None or any(dv):
+                        tier = "fast" if usage.get("speed") == "fast" else usage.get("service_tier")
+                        d = {"m": model, "e": r.get("effort") or r.get("perTurnEffort"), "t": tier,
+                             "i": dv[0], "c": dv[1], "w": dv[2], "o": dv[3], "r": dv[4], "n": 0 if prev else 1}
+                        if mid:
+                            d["id"] = mid
+                        if side:
+                            d["side"] = 1
+                        out.ev(ts, "usage", json.dumps(d, separators=(",", ":")), dv[0] + dv[3], off=off)
             api_err = bool(r.get("isApiErrorMessage"))
             if api_err or r.get("error"):
                 err = r.get("error")
@@ -471,6 +496,8 @@ def parse(job) -> dict:
         st["tools"] = dict(list(tools.items())[-400:])
     if len(out_by_id) > 20:
         st["out_by_id"] = dict(list(out_by_id.items())[-20:])
+    if len(u_by_id) > 20:
+        st["u_by_id"] = dict(list(u_by_id.items())[-20:])
     meta["out_tokens_add"] = out_delta
     st["lines"] = line_no
     meta.update({

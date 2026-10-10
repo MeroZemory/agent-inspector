@@ -20,8 +20,8 @@ from .base import Candidate, ParseOut, read_lines
 
 PROVIDER = "codex"
 # bump when parse() starts emitting new rows: ingest re-parses files whose stored state has another version
-# (2: timing events turn_start/turn_end/tool_span/compaction_span/model_step)
-PARSER_VERSION = 2
+# (2: timing events turn_start/turn_end/tool_span/compaction_span/model_step; 3: usage events, see sessionindex/usage.py)
+PARSER_VERSION = 3
 ROLLOUT_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 HDR = re.compile(rb'^\{"timestamp":"([^"]*)",(?:"ordinal":(\d+),)?"type":"([a-z_]+)"(?:,"payload":\{"type":"([a-z_]+)")?')
 ITEM_TYPE = re.compile(rb'"item":\{"type":"([A-Za-z]+)"')
@@ -29,14 +29,14 @@ FAIL_STATUS = re.compile(rb'"status":"(failed|declined)"')
 
 # originators that drive Codex programmatically (their user-role prompts are not typed by a person)
 PROGRAMMATIC_ORIGINATORS = ("codex_exec", "codex_sdk_ts", "agentryx-runner", "agentryx-probe")
-SKIP_TYPES = {"world_state", "token_usage_record", "inter_agent_communication_metadata"}
+SKIP_TYPES = {"world_state", "inter_agent_communication_metadata"}
 SKIP_EVENTS = {
     "exec_command_output_delta", "agent_message_content_delta", "agent_message_delta", "agent_reasoning_delta",
     "reasoning_content_delta", "reasoning_raw_content_delta", "agent_reasoning_raw_content",
     "agent_reasoning_raw_content_delta", "agent_reasoning_section_break", "plan_delta", "raw_response_item",
     "raw_response_completed", "item_started", "sub_agent_activity", "mcp_startup_update", "mcp_startup_complete",
     "exec_command_begin", "exec_command_end", "patch_apply_begin", "patch_apply_updated", "mcp_tool_call_begin",
-    "web_search_begin", "terminal_interaction", "turn_diff", "session_configured", "thread_settings_applied",
+    "web_search_begin", "terminal_interaction", "turn_diff", "session_configured",
     "environment_connected", "environment_disconnected", "image_generation_begin", "view_image_tool_call",
     "background_event", "mcp_list_tools_response", "list_custom_prompts_response", "get_history_entry_response",
     "hook_started", "collab_agent_spawn_begin", "collab_agent_interaction_begin", "collab_waiting_begin",
@@ -204,6 +204,24 @@ def parse(job) -> dict:
     st["pv"] = PARSER_VERSION
     # timing state (see sessionindex/timing.py): open turn, model input waiting for output, open tool calls
     tm = st.setdefault("tm", {"turn": None, "inp": None, "err": 0, "out": 0, "open": [], "calls": {}})
+    # usage state: current model / effort / service tier, token_usage_record seen, last token_count total (fallback)
+    us = st.setdefault("us", {"m": None, "e": None, "t": None, "rec": False, "tc": None})
+
+    def usage_ev(ts, u, off, rid=None, turn=None, src=None):
+        """One `usage` event per model response (sessionindex/usage.py documents the fields)."""
+        if not isinstance(u, dict):
+            return
+        d = {"m": us["m"] or st.get("model"), "e": us["e"], "t": us["t"],
+             "i": u.get("input_tokens") or 0, "c": u.get("cached_input_tokens") or 0,
+             "w": u.get("cache_write_input_tokens") or 0, "o": u.get("output_tokens") or 0,
+             "r": u.get("reasoning_output_tokens") or 0, "n": 1}
+        if rid:
+            d["id"] = rid
+        if turn:
+            d["tu"] = turn
+        if src:
+            d["src"] = src
+        out.ev(ts, "usage", json.dumps(d, separators=(",", ":")), u.get("total_tokens") or d["i"] + d["o"], off=off)
 
     def step_end(ts, end, off):
         """Close the open model step (model input -> first model output / turn end)."""
@@ -336,8 +354,25 @@ def parse(job) -> dict:
                 out.ev(ts, "resume", "session_meta repeated", off=off)
             continue
 
+        if typ == "token_usage_record":
+            if tid and pl.get("thread_id") and pl.get("thread_id") != tid:
+                out.rec_counts["token_usage_record:foreign_thread"] += 1  # copied from another thread (fork)
+                continue
+            us["rec"] = True
+            usage_ev(ts, pl.get("usage"), off, pl.get("response_id"), pl.get("turn_id"))
+            continue
+
         if typ == "turn_context":
             mdl = pl.get("model")
+            if mdl:
+                us["m"] = mdl
+            cm = ((pl.get("collaboration_mode") or {}).get("settings") or {}) if isinstance(
+                pl.get("collaboration_mode"), dict) else {}
+            eff = pl.get("effort") or pl.get("reasoning_effort") or cm.get("reasoning_effort")
+            if eff:
+                us["e"] = eff
+            if pl.get("service_tier"):
+                us["t"] = pl.get("service_tier")
             if mdl:
                 models[mdl] += 1
                 if st.get("model") and st["model"] != mdl:
@@ -491,9 +526,21 @@ def parse(job) -> dict:
         # ------------------------------------------------------------ event_msg
         if typ == "event_msg":
             et = pl.get("type")
-            if et == "token_count":
+            if et == "thread_settings_applied":
+                ts_ = pl.get("thread_settings") or {}
+                if isinstance(ts_, dict):
+                    us["m"] = ts_.get("model") or us["m"]
+                    us["e"] = ts_.get("reasoning_effort") or us["e"]
+                    us["t"] = ts_.get("service_tier") or us["t"]
+            elif et == "token_count":
                 info = pl.get("info") or {}
                 last = info.get("last_token_usage") or {}
+                # rollouts written before token_usage_record: one usage row per change of the running total
+                tt = (info.get("total_token_usage") or {}).get("total_tokens")
+                if not us["rec"] and last and tt and tt != us["tc"]:
+                    usage_ev(ts, last, off, src="token_count")
+                if tt:
+                    us["tc"] = tt
                 tot = last.get("total_tokens")
                 if info.get("model_context_window"):
                     st["ctx_window"] = info.get("model_context_window")
