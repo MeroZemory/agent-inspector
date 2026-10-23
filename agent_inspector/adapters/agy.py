@@ -29,9 +29,9 @@ conversation in a Temp/.tmp workspace or without any history entry after history
 `agy -p` run (sdk_prompt). Leading '/word' is human_command.
 
 The DB changes in place, so every change is a full re-parse (no byte-offset append). Messages store the step
-index in `offset`; `sx raw` decodes that step. A conversation still running keeps recent steps in the -wal
+index in `offset`; `agent-inspector raw` decodes that step. A conversation still running keeps recent steps in the -wal
 file (read from a private copy); the .db size/mtime may lag until agy checkpoints it, so re-ingest a live
-conversation with `sx ingest --sid <sid> --reparse`. Reads never create -wal/-shm files in agy's directory.
+conversation with `agent-inspector ingest --sid <sid> --reparse`. Reads never create -wal/-shm files in agy's directory.
 """
 from __future__ import annotations
 

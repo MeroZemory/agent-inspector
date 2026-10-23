@@ -1,4 +1,4 @@
-"""Text for `sx guide`: the single place an agent orients itself. Kept compact on purpose."""
+"""Text for `agent-inspector guide`: the single place an agent orients itself. Kept compact on purpose."""
 from __future__ import annotations
 
 from .classify import KIND_DOCS
@@ -40,12 +40,12 @@ EVENT_DOCS = {
     "external_file_edit": "Claude noticed a file edited outside the model (by the user or a tool). detail=filename.",
     "turn_duration": "Duration of a model turn in ms (Claude system turn_duration; Codex task_complete.duration_ms). value=ms.",
     "warning": "Codex warning event.",
-    "turn_start": "(timing, Codex) task_started. detail=turn id. Used by `sx timing`; excluded from sessions.events_n.",
+    "turn_start": "(timing, Codex) task_started. detail=turn id. Used by `agent-inspector timing`; excluded from sessions.events_n.",
     "turn_end": "(timing, Codex) task_complete | turn_aborted | next task_started. value=duration_ms; detail='complete|aborted:<reason>|superseded out=<model outputs in the turn> err=<task_complete error 0|1>'.",
-    "tool_span": "(timing, Codex) one tool call: ts=call, value=seconds until its output; detail='<kind> <call_id>', kind build|shell|wait|subagent|web|edit|other (see `sx guide --section timing`).",
+    "tool_span": "(timing, Codex) one tool call: ts=call, value=seconds until its output; detail='<kind> <call_id>', kind build|shell|wait|subagent|web|edit|other (see `agent-inspector guide --section timing`).",
     "compaction_span": "(timing, Codex) ContextCompaction item: ts=started_at_ms, value=seconds.",
     "model_step": "(timing, Codex) model input (turn start / tool output) to the next tool call or assistant message, or to the turn end when no tool call of the turn is open. ts=input; value=seconds; detail='<tool_call|assistant|turn_end|turn_end_error> err=<error+stream_error events inside>'.",
-    "usage": "(usage, Codex + Claude) token usage of one model response; detail=compact JSON {m model, e effort, t service tier, i input incl. cached + cache writes, c cached input, w cache-write input, o output incl. reasoning, r reasoning part of o, n responses (1, or 0 for a later Claude record that only adds changed counts), id response id, tu Codex turn id, src 'token_count' fallback, side Claude sidechain}; value=i+o. Used by `sx usage`; excluded from sessions.events_n. Query with json_extract(detail,'$.o').",
+    "usage": "(usage, Codex + Claude) token usage of one model response; detail=compact JSON {m model, e effort, t service tier, i input incl. cached + cache writes, c cached input, w cache-write input, o output incl. reasoning, r reasoning part of o, n responses (1, or 0 for a later Claude record that only adds changed counts), id response id, tu Codex turn id, src 'token_count' fallback, side Claude sidechain}; value=i+o. Used by `agent-inspector usage`; excluded from sessions.events_n. Query with json_extract(detail,'$.o').",
     "agents_killed": "Claude background agents killed.",
     "state_turn_failed": "(source home:*) Codex state DB thread_turns status=failed; detail='[turn <turn_id>] <error_json>' (turn id keeps distinct turns distinct across home copies). Not counted in sessions.errors.",
     "state_turn_interrupted": "(source home:*) Codex state DB thread_turns status=interrupted; detail='[turn <turn_id>]'. Overlaps transcript 'interrupt'; not counted in sessions.interrupts.",
@@ -58,11 +58,13 @@ ALIAS_ORIGINS = {
     "codex_thread_name_event": "Codex thread_name_updated event (manual/auto unknown)",
     "claude_ai_title": "auto (Claude ai-title)",
     "codex_session_index": "auto (CODEX_HOME/session_index.jsonl thread_name; last entry wins)",
+    "agy_title": "auto (Antigravity CLI conversation_summaries.db title)",
     "codex_state_title": "auto (state_5.sqlite threads.title)",
     "claude_summary": "auto (legacy Claude summary record)",
     "claude_agent_name": "Claude agent-name record (fallback)",
     "claude_subagent_description": "Subagent task description from .meta.json",
     "codex_agent_nickname": "Codex subagent nickname",
+    "agy_agent_name": "Antigravity CLI Teamwork subagent name",
     "orca_tab_title": "Orca tab title (customTitle/label/generated; manual vs automatic not recorded)",
     "orca_ai_vault_title": "Orca aiVaultTitle for the tab's session (auto)",
     "orca_worktree_name": "Orca worktree/folder display name",
@@ -87,7 +89,7 @@ SCHEMA_DOCS = {
         ("tool_errors/errors/interrupts/compactions/subagent_spawns/denials", "counts of transcript events (see events)"),
         ("max_ctx_tokens/ctx_window", "max context tokens seen (Claude input+cache tokens; Codex last_token_usage.total_tokens)"),
         ("title/title_origin", "best alias: manual > auto title > Orca tab/worktree name > first prompt"),
-        ("body", "0 = catalog row only (run sx ingest --sid), 1 = body ingested, 2 = body stale (file changed)"),
+        ("body", "0 = catalog row only (run agent-inspector ingest --sid), 1 = body ingested, 2 = body stale (file changed)"),
         ("hist_prompts/size_bytes", "typed prompts logged in history.jsonl for this session / canonical file size (catalog)"),
         ("first_prompt", "first prompt text (300 chars; catalog reads it from the file head)"),
         ("n_files/n_copies", "physical files for this session / distinct non-canonical content copies"),
@@ -122,7 +124,7 @@ SCHEMA_DOCS = {
 }
 
 TIMING = """\
-`sx timing [filters] [--by session|project] [--outage-min 20]` splits the IN-TURN wall time of Codex sessions
+`agent-inspector timing [filters] [--by session|project] [--outage-min 20]` splits the IN-TURN wall time of Codex sessions
 (task_started -> task_complete/turn_aborted; idle time waiting for the user is excluded) into parts that add up:
   tool       union of tool-call intervals (call -> output; parallel calls overlap, so the union is used)
   compaction ContextCompaction item durations not under a tool call
@@ -146,18 +148,18 @@ error events + output-less turns), so a genuinely slow >threshold model step cou
 count as tool time (kind wait), not model; per-kind shares overlap; a turn still open at the last record ends there.
 Codex only: Claude transcripts have tool_use/tool_result timestamps and turn_duration, but interrupted
 turns write no turn_duration and compaction has no duration, so turn boundaries would be guessed; not implemented.
-Sessions parsed before timing support are re-parsed by a plain `sx ingest --sid ...` (adapter PARSER_VERSION).
+Sessions parsed before timing support are re-parsed by a plain `agent-inspector ingest --sid ...` (adapter PARSER_VERSION).
 """
 
 USAGE = """\
-`sx usage [filters] [--by session|project|model|effort|tier|day]` sums token usage per model response (event type
+`agent-inspector usage [filters] [--by session|project|model|effort|tier|day]` sums token usage per model response (event type
 `usage`) in the window. Tokens only: no money or quota conversion (plan quotas weight models, tiers and cached input
 differently and are not published per token).
 Columns: responses, input (ALL prompt tokens: fresh + cached reads + cache writes), cached (cache reads), cache_write
 (Claude cache_creation; Codex cache_write_input_tokens, 0 in every rollout seen), output (INCLUDES reasoning for both
 providers: Codex total_tokens = input + output and reasoning <= output; Claude thinking_tokens <= output_tokens),
 reasoning (the reasoning part of output: Codex reasoning_output_tokens, Claude output_tokens_details.thinking_tokens,
-0 where the transcript has no breakdown), in_turn_h (Codex turn intervals clipped to the window, as in `sx timing`),
+0 where the transcript has no breakdown), in_turn_h (Codex turn intervals clipped to the window, as in `agent-inspector timing`),
 out_per_turn_h (output of sessions with turn timing / in_turn_h), share_pct (input+output share of the window total),
 out_share_pct (output share). The last row is the window total. --format table prints tokens in millions (*_M).
 Settings per response: Codex model/effort/tier = the latest turn_context or thread_settings_applied before the
@@ -175,35 +177,35 @@ Sources: Codex token_usage_record (records whose thread_id is another thread, i.
 rollouts older than token_usage_record fall back to token_count.last_token_usage, one row per change of the
 running total). Claude: one row per assistant message.id (split content-block records share the usage; later
 records add only changed counts); <synthetic> and imported (codex-import, pass-the-thread) records are skipped.
-Sessions parsed before usage support are re-parsed by a plain `sx ingest --sid ...` (adapter PARSER_VERSION).
+Sessions parsed before usage support are re-parsed by a plain `agent-inspector ingest --sid ...` (adapter PARSER_VERSION).
 """
 
 EXAMPLES = """\
-sx catalog                                       # refresh the full session list (light; incremental)
-sx sessions --body no --sort hist --limit 10     # busiest catalog-only sessions by typed prompts
-sx ingest --sid xabc123,cdef456                  # parse only the bodies you picked
-sx stats --by month                              # corpus shape
-sx ingest --project Agentryx --since 2026-09-20   # index only what you need (also --sid/--file/--source/--until)
-sx sessions --provider codex --min-human 5 --sort human_chars --limit 10
-sx sessions --project Agentryx --since 2026-09-01 --has-event interrupt
-sx show <sid>                                    # metadata + one line per human turn
-sx read <sid> --kinds human,assistant --limit 40 # conversation without tool noise
-sx read <sid> --turn 3-5 --full                  # everything in turns 3..5, untruncated
-sx raw <sid> --seq 12                            # original JSON line from the source file
-sx search '"다시 해"' --human --limit 20         # Korean phrase in human messages (>=3 chars)
-sx search 'rate limit' --kinds tool_output,api_error
-sx search 'ㅋㅋ|헐|이게 뭐' --regex --human --project maplestory   # regex (case-insensitive) over full text, human only
-sx sessions --provider agy --project maplestory --subagents include   # Antigravity CLI (agy) incl. Teamwork subagents
-sx timing --since 2026-10-07T15:00Z --by session --format table   # Codex in-turn time: model / tool kinds / outage
-sx timing --project QAAI --by project --outage-min 10
-sx usage --since 2026-10-07T15:00Z --by session --format table     # tokens per session (Codex + Claude)
-sx usage --since 2026-10-07T15:00Z --provider codex --by tier --subagents include
-sx sql "SELECT type, COUNT(*) n FROM events GROUP BY type ORDER BY n DESC"
-sx sql "SELECT s.project, AVG(s.interrupts) FROM sessions s WHERE s.origin_class='interactive' GROUP BY 1"
-sx sessions --has-event rate_limit,token_pressure --sort last   # problem-signal filter
-sx sql "WITH t AS (SELECT sid, seq, kind, text, LAG(kind) OVER (PARTITION BY sid ORDER BY seq) pk FROM messages WHERE kind IN ('human','interrupt_marker')) SELECT sid, seq, substr(text,1,120) t FROM t WHERE kind='human' AND pk='interrupt_marker' LIMIT 20"   # what people typed right after interrupting
-sx note <sid> --seq 12 --tag correction --note "user re-asks same fix"   # write
-sx notes --tag correction                                                # read
+agent-inspector catalog                                       # refresh the full session list (light; incremental)
+agent-inspector sessions --body no --sort hist --limit 10     # busiest catalog-only sessions by typed prompts
+agent-inspector ingest --sid xabc123,cdef456                  # parse only the bodies you picked
+agent-inspector stats --by month                              # corpus shape
+agent-inspector ingest --project Agentryx --since 2026-09-20   # index only what you need (also --sid/--file/--source/--until)
+agent-inspector sessions --provider codex --min-human 5 --sort human_chars --limit 10
+agent-inspector sessions --project Agentryx --since 2026-09-01 --has-event interrupt
+agent-inspector show <sid>                                    # metadata + one line per human turn
+agent-inspector read <sid> --kinds human,assistant --limit 40 # conversation without tool noise
+agent-inspector read <sid> --turn 3-5 --full                  # everything in turns 3..5, untruncated
+agent-inspector raw <sid> --seq 12                            # original JSON line from the source file
+agent-inspector search '"다시 해"' --human --limit 20         # Korean phrase in human messages (>=3 chars)
+agent-inspector search 'rate limit' --kinds tool_output,api_error
+agent-inspector search 'ㅋㅋ|헐|이게 뭐' --regex --human --project maplestory   # regex (case-insensitive) over full text, human only
+agent-inspector sessions --provider agy --project maplestory --subagents include   # Antigravity CLI (agy) incl. Teamwork subagents
+agent-inspector timing --since 2026-10-07T15:00Z --by session --format table   # Codex in-turn time: model / tool kinds / outage
+agent-inspector timing --project QAAI --by project --outage-min 10
+agent-inspector usage --since 2026-10-07T15:00Z --by session --format table     # tokens per session (Codex + Claude)
+agent-inspector usage --since 2026-10-07T15:00Z --provider codex --by tier --subagents include
+agent-inspector sql "SELECT type, COUNT(*) n FROM events GROUP BY type ORDER BY n DESC"
+agent-inspector sql "SELECT s.project, AVG(s.interrupts) FROM sessions s WHERE s.origin_class='interactive' GROUP BY 1"
+agent-inspector sessions --has-event rate_limit,token_pressure --sort last   # problem-signal filter
+agent-inspector sql "WITH t AS (SELECT sid, seq, kind, text, LAG(kind) OVER (PARTITION BY sid ORDER BY seq) pk FROM messages WHERE kind IN ('human','interrupt_marker')) SELECT sid, seq, substr(text,1,120) t FROM t WHERE kind='human' AND pk='interrupt_marker' LIMIT 20"   # what people typed right after interrupting
+agent-inspector note <sid> --seq 12 --tag correction --note "user re-asks same fix"   # write
+agent-inspector notes --tag correction                                                # read
 """
 
 CAVEATS = """\
@@ -214,36 +216,37 @@ CAVEATS = """\
   only the canonical copy (latest last timestamp) is parsed; others are listed in `files`.
 - Rewritten Codex copies can have collapsed timestamps (all records = thread start); canonical selection avoids them
   when a better copy exists.
-- Tool outputs are capped (default 4 KB), tool args 16 KB, injected text 4 KB; text_len keeps the original length;
-  `sx raw` returns the full source record.
+- Tool outputs are capped (default 4 KB), tool call arguments 256 KB, injected text 4 KB; text_len keeps the original
+  length and `agent-inspector raw` returns the full source record.
 - Trigram FTS needs >= 3 characters per term; shorter queries fall back to LIKE (slow). Quote phrases: '"..."'.
-  `--regex` (or `text REGEXP 'pat'` in sx sql) scans full stored text with a Python regex.
-- agy (Antigravity CLI): files are SQLite DBs; messages.offset = step index and `sx raw` prints the decoded step.
-  A running agy conversation grows its -wal, not the .db: re-ingest it with `sx ingest --sid <sid> --reparse`.
+  `--regex` (or `text REGEXP 'pat'` in agent-inspector sql) scans full stored text with a Python regex.
+- agy (Antigravity CLI): files are SQLite DBs; messages.offset = step index and `agent-inspector raw` prints the decoded step.
+  A running agy conversation grows its -wal, not the .db: re-ingest it with `agent-inspector ingest --sid <sid> --reparse`.
   agy human-vs-scripted (`agy -p`) is inferred from history.jsonl + Temp workspaces (README).
 - Counts exclude messages marked imported/inherited (fork prefix copies, Codex->Claude imports).
 - events from source home:* (Codex state DBs) duplicate some transcript signals and are excluded from session counters.
 - Canonical copy = latest last-record timestamp, then more lines, then lowest root rank (codex-home=0).
-- Tool call arguments are stored up to 256 KB; `sx raw` has the rest.
-- Orca metadata adapter is not implemented yet (Orca-run sessions are indexed via their Codex/Claude homes);
-  external per-session metadata can join on sessions.pid (Claude sessionId / Codex thread id) or sessions.cwd_key.
+- Orca metadata (`agent_inspector/orca.py`) is collected during `agent-inspector catalog` into table `orca` and `orca_*`
+  aliases, joined by provider session id (`method=sessionId`) or cwd + time overlap (`method=cwd_time`).
 """
 
 
 def build(sections, live: dict) -> str:
     out = []
     if "overview" in sections:
-        out.append("# sx - session index guide")
+        out.append("# agent-inspector - guide")
         out.append(f"db={live.get('db')} last_ingest={live.get('last_ingest')} sessions={live.get('sessions')} "
                    f"messages={live.get('messages')} events={live.get('events')}")
         out.append("Output is JSON Lines by default (--format table for humans). IDs: sid prefix or provider id prefix.")
-        out.append("Commands: guide stats sessions show read raw search sql timing usage note notes ingest  (sx <cmd> -h for flags)")
-        out.append("Workflow: 1) `sx catalog` (if the catalog is missing/old; lists EVERY session from file heads/tails + "
-                   "provider/Orca metadata, no bodies)  2) `sx sessions [filters]` / `sx stats` / `sx show <sid>` on the "
-                   "catalog (body=0 rows have titles, cwd, times, sizes, typed-prompt counts)  3) `sx ingest --sid a,b` "
-                   "(or --project P --since D) for the sessions you selected  4) `sx show <sid>` (one line per human "
-                   "turn) -> `sx read <sid> --turn a-b` -> `sx raw <sid> --seq N` -> `sx search` (ingested bodies only). "
-                   "Record findings with `sx note`.")
+        out.append("Commands: guide catalog stats sessions show read raw search sql timing usage note notes ingest  "
+                   "(agent-inspector <cmd> -h for flags)")
+        out.append("Workflow: 1) `agent-inspector catalog` (if the catalog is missing/old; lists EVERY session from file "
+                   "heads/tails + provider/Orca metadata, no bodies)  2) `agent-inspector sessions [filters]` / "
+                   "`agent-inspector stats` / `agent-inspector show <sid>` on the catalog (body=0 rows have titles, cwd, "
+                   "times, sizes, typed-prompt counts)  3) `agent-inspector ingest --sid a,b` (or --project P --since D) "
+                   "for the sessions you selected  4) `agent-inspector show <sid>` (one line per human turn) -> "
+                   "`agent-inspector read <sid> --turn a-b` -> `agent-inspector raw <sid> --seq N` -> "
+                   "`agent-inspector search` (ingested bodies only). Record findings with `agent-inspector note`.")
     if "schema" in sections:
         out.append("\n## schema (tables: columns - meaning)")
         for t, cols in SCHEMA_DOCS.items():
@@ -263,9 +266,9 @@ def build(sections, live: dict) -> str:
         for k, d in ALIAS_ORIGINS.items():
             out.append(f"  {k}: {d}")
     if "timing" in sections:
-        out.append("\n## timing (sx timing)\n" + TIMING)
+        out.append("\n## timing (agent-inspector timing)\n" + TIMING)
     if "usage" in sections:
-        out.append("\n## usage (sx usage)\n" + USAGE)
+        out.append("\n## usage (agent-inspector usage)\n" + USAGE)
     if "examples" in sections:
         out.append("\n## examples\n" + EXAMPLES)
     if "caveats" in sections:

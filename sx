@@ -1,2 +1,0 @@
-#!/bin/sh
-PYTHONUTF8=1 exec python "$(dirname "$0")/sx.py" "$@"

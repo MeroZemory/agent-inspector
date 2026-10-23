@@ -152,7 +152,7 @@ def init_index(con: sqlite3.Connection) -> None:
         row = None
     if row and row[0] != SCHEMA_VERSION:
         raise SchemaMismatch(f"index.sqlite has schema {row[0]}, code expects {SCHEMA_VERSION}: "
-                             f"run `sx ingest --rebuild` (annotations are kept)")
+                             f"run `agent-inspector ingest --rebuild` (annotations are kept)")
     con.executescript(INDEX_DDL)
     con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (SCHEMA_VERSION,))
     con.commit()

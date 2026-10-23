@@ -16,7 +16,7 @@ import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sessionindex.config import DB_PATH  # noqa: E402
+from agent_inspector.config import DB_PATH  # noqa: E402
 
 HUMAN = ("human", "human_command", "human_shell")
 IMG = re.compile(r"<image\b[^>]*>|</image>|\[image\]")  # image markup differs between Codex representations

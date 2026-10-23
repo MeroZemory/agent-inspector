@@ -1,4 +1,4 @@
-"""sx: query CLI for agents. JSON Lines by default; --format table for humans."""
+"""agent-inspector: query and inspection CLI for AI coding agents. JSON Lines by default; --format table for humans."""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +23,7 @@ SORTS = {
 SESSION_FIELDS = ["sid", "provider", "kind", "origin_class", "started_at", "last_activity_at", "project", "title",
                   "body", "hist_prompts", "size_bytes", "human_msgs", "human_chars", "assistant_msgs", "tool_calls",
                   "tool_errors", "errors", "interrupts", "compactions", "active_s"]
-BODY_HINT = "body not ingested (catalog row only): run `sx ingest --sid {sid}` first"
+BODY_HINT = "body not ingested (catalog row only): run `agent-inspector ingest --sid {sid}` first"
 
 
 # ------------------------------------------------------------------ output helpers
@@ -75,7 +75,7 @@ def die(msg: str, code: int = 2):
 
 def ro():
     if not os.path.exists(DB_PATH):
-        die(f"index not found at {DB_PATH}; run: sx ingest")
+        die(f"index not found at {DB_PATH}; run: agent-inspector catalog")
     return connect_ro(DB_PATH, ANN_PATH)
 
 
@@ -99,7 +99,7 @@ def resolve(con, ident: str) -> str:
 # ------------------------------------------------------------------ session filters (shared)
 
 def add_filters(p):
-    p.add_argument("--provider", "--source", dest="provider", help="claude | codex | opencode")
+    p.add_argument("--provider", "--source", dest="provider", help="claude | codex | agy | opencode")
     p.add_argument("--project", help="substring of derived project name or project_root")
     p.add_argument("--cwd", help="substring of cwd")
     p.add_argument("--alias", help="substring of any alias/title")
@@ -280,9 +280,9 @@ def cmd_show(a):
     if meta.get("first_prompt"):
         meta["first_prompt"] = clip(meta["first_prompt"].replace("\n", " "), 160)
     if not s.get("body"):
-        meta["next"] = f"sx ingest --sid {sid}   # catalog row only; then sx show/read"
+        meta["next"] = f"agent-inspector ingest --sid {sid}   # catalog row only; then agent-inspector show/read"
     elif s.get("body") == 2:
-        meta["next"] = f"sx ingest --sid {sid}   # body is stale (file changed since ingest)"
+        meta["next"] = f"agent-inspector ingest --sid {sid}   # body is stale (file changed since ingest)"
     orca = [{"kind": r[0], "name": clip(r[1], 60), "detail": clip(r[2], 80), "via": r[3]} for r in con.execute(
         "SELECT kind, name, detail, method FROM orca WHERE sid=? ORDER BY method DESC, kind LIMIT 8", (sid,))]
     if orca:
@@ -295,7 +295,7 @@ def cmd_show(a):
         (sid,))][:12]
     older = con.execute("SELECT COUNT(*) FROM aliases WHERE sid=? AND COALESCE(current,0)=0", (sid,)).fetchone()[0]
     if older:
-        meta["older_aliases"] = older  # superseded names: sx sql "SELECT * FROM aliases WHERE sid='..'"
+        meta["older_aliases"] = older  # superseded names: agent-inspector sql "SELECT * FROM aliases WHERE sid='..'"
     meta["events"] = {r[0]: r[1] for r in con.execute(
         "SELECT type, COUNT(*) FROM events WHERE sid=? GROUP BY type ORDER BY 2 DESC", (sid,))}
     meta["links"] = [{"rel": r[0], "dst": r[1], "dst_pid": r[2], "exists": bool(r[3])} for r in con.execute(
@@ -356,7 +356,7 @@ def need_body(con, sid):
     if not b or not b[0]:
         die(BODY_HINT.format(sid=sid), 3)
     if b[0] == 2:
-        sys.stderr.write(f"[sx] body of {sid} is stale; refresh: sx ingest --sid {sid}\n")
+        sys.stderr.write(f"[agent-inspector] body of {sid} is stale; refresh: agent-inspector ingest --sid {sid}\n")
 
 
 def cmd_read(a):
@@ -461,8 +461,8 @@ def cmd_search(a):
     w, args = filter_sql(a, con)
     nb = con.execute(f"SELECT COUNT(*), SUM(COALESCE(s.body,0)=0) FROM sessions s WHERE {w}", args).fetchone()
     if nb[1]:
-        sys.stderr.write(f"[sx] searching bodies only: {nb[1]} of {nb[0]} matching sessions are catalog-only; "
-                         f"ingest them first (sx ingest --sid a,b | --project P --since D)\n")
+        sys.stderr.write(f"[agent-inspector] searching bodies only: {nb[1]} of {nb[0]} matching sessions are catalog-only; "
+                         f"ingest them first (agent-inspector ingest --sid a,b | --project P --since D)\n")
     kinds = None
     if a.human:
         kinds = list(HUMAN_KINDS)
@@ -497,7 +497,7 @@ def cmd_search(a):
         return
     if use_like:
         if short and not a.like:
-            sys.stderr.write("[sx] term shorter than 3 chars: trigram FTS cannot match; using LIKE scan (slower)\n")
+            sys.stderr.write("[agent-inspector] term shorter than 3 chars: trigram FTS cannot match; using LIKE scan (slower)\n")
         like = a.query.strip('"')
         q = (f"SELECT m.sid, m.seq, m.ts, m.kind, s.project, m.text, m.text_len FROM messages m JOIN sessions s "
              f"ON s.sid=m.sid WHERE m.text LIKE ? AND {w}{kw} ORDER BY {order if order != 'rank' else 'm.ts DESC'} "
@@ -541,7 +541,7 @@ def cmd_sql(a):
     n = 0
     for r in cur:
         if not a.all and n >= a.limit:
-            sys.stderr.write(f"[sx] stopped at --limit {a.limit} rows (use --all)\n")
+            sys.stderr.write(f"[agent-inspector] stopped at --limit {a.limit} rows (use --all)\n")
             break
         d = {c: (clip(v, a.width) if (isinstance(v, str) and not a.full) else v) for c, v in zip(cols, r)}
         o.emit(d)
@@ -564,7 +564,7 @@ def cmd_note(a):
     acon = connect_rw(ANN_PATH)
     init_ann(acon)
     cur = acon.execute("INSERT INTO annotations(sid,seq,tag,note,author,created_at,anchor) VALUES(?,?,?,?,?,?,?)",
-                       (sid, a.seq, a.tag, a.note, a.author or os.environ.get("SX_AUTHOR") or "agent", now_iso(),
+                       (sid, a.seq, a.tag, a.note, a.author or os.environ.get("AI_AUTHOR") or os.environ.get("SX_AUTHOR") or "agent", now_iso(),
                         anchor))
     acon.commit()
     sys.stdout.write(json.dumps({"ok": True, "id": cur.lastrowid, "sid": sid}) + "\n")
@@ -632,8 +632,8 @@ def cmd_timing(a):
         if r and r["in_turn"] > 0:
             parts[sid] = (project, title, r)
     if missing:
-        sys.stderr.write(f"[sx] {len(missing)} selected session(s) have no timing events (no turns, or parsed before "
-                         f"timing support): sx ingest --sid {','.join(missing[:20])}\n")
+        sys.stderr.write(f"[agent-inspector] {len(missing)} selected session(s) have no timing events (no turns, or parsed before "
+                         f"timing support): agent-inspector ingest --sid {','.join(missing[:20])}\n")
     if a.by == "project":
         groups = {}
         for sid, (project, title, r) in parts.items():
@@ -740,12 +740,12 @@ def cmd_usage(a):
                 elif k in buckets:
                     buckets[k]["in_turn_s"] += s
     if missing:
-        sys.stderr.write(f"[sx] {len(missing)} selected session(s) with an ingested body have no usage events (parsed "
-                         f"before usage support): sx ingest --sid {','.join(missing[:20])}\n")
+        sys.stderr.write(f"[agent-inspector] {len(missing)} selected session(s) with an ingested body have no usage events (parsed "
+                         f"before usage support): agent-inspector ingest --sid {','.join(missing[:20])}\n")
     if dups:
-        sys.stderr.write(f"[sx] {dups} response(s) already counted in another selected session were skipped\n")
+        sys.stderr.write(f"[agent-inspector] {dups} response(s) already counted in another selected session were skipped\n")
     if unattr:
-        sys.stderr.write(f"[sx] {unattr / 3600:.2f} in-turn h had no response in the window and are not attributed "
+        sys.stderr.write(f"[agent-inspector] {unattr / 3600:.2f} in-turn h had no response in the window and are not attributed "
                          f"to any {a.by}\n")
     grand = usage.new_bucket()
     for b in buckets.values():
@@ -818,7 +818,7 @@ def cmd_catalog(a):
 def cmd_ingest(a):
     if not (a.all or a.sid or a.file or a.project or a.since or a.until or a.source or a.reparse_sql):
         die("ingest parses transcript bodies: select what you need (--sid/--file/--project/--since/--until/"
-            "--source) or pass --all for everything. The session list itself comes from `sx catalog`.")
+            "--source) or pass --all for everything. The session list itself comes from `agent-inspector catalog`.")
     from .ingest import run_ingest
     stats = run_ingest(source=a.source.split(",") if a.source else None, rebuild=a.rebuild, workers=a.workers,
                        max_jobs=a.max_jobs, reparse=a.reparse, reparse_sql=a.reparse_sql,
@@ -830,7 +830,7 @@ def cmd_ingest(a):
 # ------------------------------------------------------------------ parser
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="sx", description="Query the local AI-session index. Start with: sx guide")
+    p = argparse.ArgumentParser(prog="agent-inspector", description="Inspect and query local AI coding-agent sessions, transcripts, events, timing and token usage. Start with: agent-inspector guide")
     p.add_argument("--format", choices=["jsonl", "table"], default="jsonl")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--format", choices=["jsonl", "table"], default=argparse.SUPPRESS,
@@ -961,7 +961,7 @@ def build_parser():
     s.set_defaults(fn=cmd_catalog)
 
     s = sub.add_parser("ingest", help="parse transcript bodies of selected sessions (see --sid/--project/...)")
-    s.add_argument("--source", help="comma list: claude,codex,cc_transcripts or root ids/labels")
+    s.add_argument("--source", help="comma list: claude,codex,agy,cc_transcripts or root ids/labels")
     s.add_argument("--rebuild", action="store_true", help="drop index.sqlite and re-parse (annotations kept)")
     s.add_argument("--all", action="store_true", help="ingest every session body (slow: ~2 h for this PC)")
     s.add_argument("--reparse", action="store_true",

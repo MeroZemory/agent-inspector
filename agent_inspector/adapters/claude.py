@@ -15,7 +15,7 @@ from .base import CAT_BYTES, Candidate, ParseOut, read_head_tail, read_lines
 
 PROVIDER = "claude"
 # bump when parse() starts emitting new rows: ingest re-parses files whose stored state has another version
-# (2: usage events, see sessionindex/usage.py)
+# (2: usage events, see agent_inspector/usage.py)
 PARSER_VERSION = 2
 TOKENS_LEFT_RE = re.compile(r"<total_tokens>\s*(\d+)")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")

@@ -25,7 +25,7 @@ import urllib.parse
 
 from .util import iso_to_epoch, jdump, norm_path, norm_ts
 
-BASE = os.path.expanduser(os.environ.get("SX_ORCA_DIR") or "~/AppData/Roaming/orca")
+BASE = os.path.expanduser(os.environ.get("AI_ORCA_DIR") or os.environ.get("SX_ORCA_DIR") or "~/AppData/Roaming/orca")
 _FORBIDDEN = ("orca-runtime.json", "claude-accounts", "recovery-backups", "recovery-tools", "ai-vault")
 _DETAIL_COLS = ("status", "state", "stage", "failure_count", "last_failure", "last_error", "termination_reason",
                 "recovery_attempt_count", "display_name", "run_id", "task_id")

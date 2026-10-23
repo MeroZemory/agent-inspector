@@ -16,11 +16,11 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sessionindex.adapters import ADAPTERS  # noqa: E402
-from sessionindex.adapters.agy import _user_kind as agy_kind  # noqa: E402
-from sessionindex.classify import claude_user_text_kind, codex_user_text_kind  # noqa: E402
-from sessionindex.config import expand_roots, load_config  # noqa: E402
-from sessionindex import timing  # noqa: E402
+from agent_inspector.adapters import ADAPTERS  # noqa: E402
+from agent_inspector.adapters.agy import _user_kind as agy_kind  # noqa: E402
+from agent_inspector.classify import claude_user_text_kind, codex_user_text_kind  # noqa: E402
+from agent_inspector.config import expand_roots, load_config  # noqa: E402
+from agent_inspector import timing  # noqa: E402
 
 
 def job_for(root, c, path=None, start=0, state=None):
@@ -216,7 +216,7 @@ def usage_cases(tmp):
     records skipped, token_count fallback with repeated totals, Claude split records counted once, streaming
     output deltas across an append resume, synthetic/imported records skipped; plus in-turn attribution."""
     import json
-    from sessionindex import usage
+    from agent_inspector import usage
     t0 = 1_800_000_000
 
     def ts(s):
@@ -319,7 +319,7 @@ def main():
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(synthetic())
-    t0 = tempfile.mkdtemp(prefix="sx-selftest-")
+    t0 = tempfile.mkdtemp(prefix="agent-inspector-selftest-")
     try:
         print(bad_lines(t0))
         tr = timing_rollout(t0)
@@ -330,7 +330,7 @@ def main():
     finally:
         shutil.rmtree(t0, ignore_errors=True)
     roots = expand_roots(load_config())
-    tmp = tempfile.mkdtemp(prefix="sx-selftest-")
+    tmp = tempfile.mkdtemp(prefix="agent-inspector-selftest-")
     fails = 0
     try:
         for adapter in ("claude", "codex", "cc_transcripts", "agy"):

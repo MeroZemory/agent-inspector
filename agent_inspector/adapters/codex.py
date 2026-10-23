@@ -20,7 +20,7 @@ from .base import Candidate, ParseOut, read_lines
 
 PROVIDER = "codex"
 # bump when parse() starts emitting new rows: ingest re-parses files whose stored state has another version
-# (2: timing events turn_start/turn_end/tool_span/compaction_span/model_step; 3: usage events, see sessionindex/usage.py)
+# (2: timing events turn_start/turn_end/tool_span/compaction_span/model_step; 3: usage events, see agent_inspector/usage.py)
 PARSER_VERSION = 3
 ROLLOUT_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 HDR = re.compile(rb'^\{"timestamp":"([^"]*)",(?:"ordinal":(\d+),)?"type":"([a-z_]+)"(?:,"payload":\{"type":"([a-z_]+)")?')

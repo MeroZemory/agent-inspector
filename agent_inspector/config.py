@@ -10,10 +10,10 @@ from .util import expand
 
 PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(PKG_DIR)
-DATA_DIR = os.environ.get("SX_DATA_DIR") or os.path.join(PROJECT_DIR, "data")
-DB_PATH = os.environ.get("SX_DB") or os.path.join(DATA_DIR, "index.sqlite")
-ANN_PATH = os.environ.get("SX_ANN_DB") or os.path.join(DATA_DIR, "annotations.sqlite")
-SOURCES_PATH = os.environ.get("SX_SOURCES") or os.path.join(PROJECT_DIR, "sources.json")
+DATA_DIR = os.environ.get("AI_DATA_DIR") or os.environ.get("SX_DATA_DIR") or os.path.join(PROJECT_DIR, "data")
+DB_PATH = os.environ.get("AI_DB") or os.environ.get("SX_DB") or os.path.join(DATA_DIR, "index.sqlite")
+ANN_PATH = os.environ.get("AI_ANN_DB") or os.environ.get("SX_ANN_DB") or os.path.join(DATA_DIR, "annotations.sqlite")
+SOURCES_PATH = os.environ.get("AI_SOURCES") or os.environ.get("SX_SOURCES") or os.path.join(PROJECT_DIR, "sources.json")
 
 DEFAULT_CAPS = {"tool_output_chars": 4096, "tool_args_chars": 262144, "injected_chars": 4096}
 

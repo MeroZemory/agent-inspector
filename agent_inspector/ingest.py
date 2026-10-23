@@ -104,8 +104,8 @@ def discover(roots, cfg):
 
 # --------------------------------------------------------------------------- main
 
-MAX_CONCURRENT_INGESTS = int(os.environ.get("SX_MAX_INGESTS", "1"))  # >1 risks unique-key races between writers
-DEFAULT_WORKERS = int(os.environ.get("SX_WORKERS", "2"))
+MAX_CONCURRENT_INGESTS = int(os.environ.get("AI_MAX_INGESTS") or os.environ.get("SX_MAX_INGESTS", "1"))  # >1 risks unique-key races between writers
+DEFAULT_WORKERS = int(os.environ.get("AI_WORKERS") or os.environ.get("SX_WORKERS", "2"))
 
 
 class _IngestSlot:
@@ -132,7 +132,7 @@ class _IngestSlot:
                 except OSError:
                     fh.close()
             if not waited:
-                print(f"[sx] {MAX_CONCURRENT_INGESTS} ingests already running; waiting for a free slot...", file=sys.stderr)
+                print(f"[agent-inspector] {MAX_CONCURRENT_INGESTS} ingests already running; waiting for a free slot...", file=sys.stderr)
                 waited = True
             time.sleep(5)
 
@@ -980,7 +980,7 @@ def _finalize(con, touched, group_info, root_by_id):
     for row in con.execute(
             "SELECT sid, SUM(type IN ('tool_error','tool_aborted')), SUM(type IN ('api_error','rate_limit','turn_error')),"
             " SUM(type='interrupt'), SUM(type='compaction'), SUM(type='subagent_spawn'), SUM(type='tool_denied'),"
-            " SUM(type NOT IN ('turn_start','turn_end','tool_span','compaction_span','model_step','usage'))"  # sx timing/usage rows
+            " SUM(type NOT IN ('turn_start','turn_end','tool_span','compaction_span','model_step','usage'))"  # timing/usage rows
             " FROM events WHERE source='transcript' AND sid IN (SELECT sid FROM touched) GROUP BY sid"):
         ev[row[0]] = list(row[1:])
     # active time: sum of inter-message gaps <= 30 min
